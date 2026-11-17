@@ -10,7 +10,7 @@
 // ==========================================
 
 #ifndef SOFTWARE_VERSION
-#define SOFTWARE_VERSION "0.1.0"
+#define SOFTWARE_VERSION "0.1.0e"
 #endif
 #define MAX_OTA_FW_SIZE 0x1D0000UL
 #define DEBUG 1
@@ -98,6 +98,8 @@ struct Settings
    bool autoRotation;
    bool forceDownload;
    bool skipSetupMode;
+   bool requireImageDigest;
+   uint8_t activeSlot;
 };
 
 struct SystemData

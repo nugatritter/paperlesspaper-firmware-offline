@@ -3,6 +3,7 @@
 #include <SerialFlash.h>
 #include <WiFi.h>
 #include <qrcode.h>
+#include <memory>
 
 // Externs from main.cpp
 extern SerialFlashFile saveFile;
@@ -282,7 +283,50 @@ void displayOverlays(DisplayType &display, DisplayInfo displayData, bool invertC
    }
 }
 
-int setImageFromFS_7inch(String fileName) {
+static const char IMAGE_ERROR_TEXT[] = "Error: Picture download failed, please try again";
+static constexpr int IMAGE_ERROR_OVERLAY_LEFT = 24;
+static constexpr int IMAGE_ERROR_OVERLAY_TOP = 24;
+static constexpr int IMAGE_ERROR_MASK_WIDTH = 64;
+static constexpr int IMAGE_ERROR_MASK_HEIGHT = 640;
+// The landscape panel rotates the streamed raster axes, so physical top-left is near the stream's right edge.
+static constexpr int IMAGE_ERROR_STREAM_LEFT = IMG_WIDTH - IMAGE_ERROR_OVERLAY_LEFT - IMAGE_ERROR_MASK_WIDTH;
+
+static uint8_t overlayFontDirection() {
+   return (uint8_t)((displaySettings.rotationText + 1 - displaySettings.rotationPicture) & 3);
+}
+
+static void drawImageErrorOverlay() {
+   const uint8_t direction = overlayFontDirection();
+   u8g2_for_adafruit_gfx.setFont(FONT_BIG);
+   const int16_t textWidth = u8g2_for_adafruit_gfx.getUTF8Width(IMAGE_ERROR_TEXT);
+   const int16_t ascent = u8g2_for_adafruit_gfx.getFontAscent();
+   const int16_t descent = u8g2_for_adafruit_gfx.getFontDescent();
+   const int16_t textHeight = ascent - descent;
+   const int16_t screenWidth = display.width();
+   const int16_t screenHeight = display.height();
+   int16_t cursorX = IMAGE_ERROR_OVERLAY_LEFT;
+   int16_t cursorY = IMAGE_ERROR_OVERLAY_TOP + textHeight / 2;
+   if (direction == 1) {
+      cursorX = IMAGE_ERROR_OVERLAY_LEFT + textHeight / 2;
+      cursorY = IMAGE_ERROR_OVERLAY_TOP;
+   }
+   else if (direction == 2) {
+      cursorX = screenWidth - IMAGE_ERROR_OVERLAY_LEFT;
+   }
+   else if (direction == 3) {
+      cursorX = IMAGE_ERROR_OVERLAY_LEFT + textHeight / 2;
+      cursorY = IMAGE_ERROR_OVERLAY_TOP + textWidth;
+   }
+   u8g2_for_adafruit_gfx.setFontMode(0);
+   u8g2_for_adafruit_gfx.setFontDirection(direction);
+   u8g2_for_adafruit_gfx.setForegroundColor(GxEPD_BLACK);
+   u8g2_for_adafruit_gfx.setBackgroundColor(GxEPD_WHITE);
+   u8g2_for_adafruit_gfx.setCursor(cursorX, cursorY);
+   u8g2_for_adafruit_gfx.print(IMAGE_ERROR_TEXT);
+   u8g2_for_adafruit_gfx.setFontDirection(0);
+}
+
+int setImageFromFS_7inch(String fileName, bool errorOverlay) {
    epaperIsUpdating = true;
    saveFile = SerialFlash.open(fileName.c_str());
    if (!saveFile) {
@@ -356,6 +400,8 @@ int setImageFromFS_7inch(String fileName) {
             }
          }
       }
+      if (errorOverlay)
+         drawImageErrorOverlay();
    }
    while (display.nextPage());
 
@@ -366,7 +412,7 @@ int setImageFromFS_7inch(String fileName) {
    return 0;
 }
 
-int setImageFromFS_13inch(String fileName, bool doRefresh) {
+int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
    epaperIsUpdating = true;
    saveFile = SerialFlash.open(fileName.c_str());
    if (!saveFile) {
@@ -449,6 +495,57 @@ int setImageFromFS_13inch(String fileName, bool doRefresh) {
 
    Serial.println("[EPD] Streaming Partial Image to Display... ");
    const bool rotate180 = (displaySettings.rotationPicture > 0);
+   std::unique_ptr<GFXcanvas1> overlayCanvas;
+   std::unique_ptr<GFXcanvas1> overlayBackgroundCanvas;
+   if (errorOverlay) {
+      overlayCanvas.reset(new GFXcanvas1(IMAGE_ERROR_MASK_WIDTH, IMAGE_ERROR_MASK_HEIGHT));
+      overlayBackgroundCanvas.reset(new GFXcanvas1(IMAGE_ERROR_MASK_WIDTH, IMAGE_ERROR_MASK_HEIGHT));
+      if (!overlayCanvas || !overlayBackgroundCanvas || overlayCanvas->getBuffer() == nullptr ||
+          overlayBackgroundCanvas->getBuffer() == nullptr) {
+         Serial.println("[EPD] Could not allocate error overlay mask.");
+         saveFile.close();
+         epaperIsUpdating = false;
+         return -1;
+      }
+      overlayCanvas->fillScreen(0);
+      overlayBackgroundCanvas->fillScreen(0);
+      U8G2_FOR_ADAFRUIT_GFX overlayFont;
+      overlayFont.begin(*overlayCanvas);
+      overlayFont.setFont(FONT_BIG);
+      overlayFont.setFontMode(1);
+      const uint8_t direction = overlayFontDirection();
+      overlayFont.setFontDirection(direction);
+      overlayFont.setForegroundColor(1);
+      overlayFont.setBackgroundColor(0);
+      const int16_t textWidth = overlayFont.getUTF8Width(IMAGE_ERROR_TEXT);
+      const int16_t textHeight = overlayFont.getFontAscent() - overlayFont.getFontDescent();
+      if (textWidth <= 0 || textWidth > IMAGE_ERROR_MASK_HEIGHT - 20 || textHeight <= 0 || textHeight > IMAGE_ERROR_MASK_WIDTH - 12) {
+         Serial.println("[EPD] Error text does not fit the overlay mask.");
+         saveFile.close();
+         epaperIsUpdating = false;
+         return -1;
+      }
+      int16_t backgroundLeft = (IMAGE_ERROR_MASK_WIDTH - textHeight) / 2 - 4;
+      if (direction == 1)
+         backgroundLeft = 12;
+      else if (direction == 3)
+         backgroundLeft = 48 - textHeight - 4;
+      const int16_t backgroundTop = 8;
+      overlayBackgroundCanvas->fillRect(backgroundLeft, backgroundTop, textHeight + 8, textWidth + 12, 1);
+      if (direction == 1) {
+         overlayFont.setCursor(16, IMAGE_ERROR_OVERLAY_TOP);
+      }
+      else if (direction == 2) {
+         overlayFont.setCursor(IMAGE_ERROR_MASK_WIDTH - IMAGE_ERROR_OVERLAY_LEFT, 16 + textHeight / 2);
+      }
+      else if (direction == 3) {
+         overlayFont.setCursor(48, IMAGE_ERROR_OVERLAY_TOP + textWidth);
+      }
+      else {
+         overlayFont.setCursor(IMAGE_ERROR_OVERLAY_LEFT, 16 + textHeight / 2);
+      }
+      overlayFont.print(IMAGE_ERROR_TEXT);
+   }
 
    for (int half = 0; half < 2; half++) {
       int csPin = (half == 0) ? CS_EPD_PIN : EPD_CS_S;
@@ -519,8 +616,26 @@ int setImageFromFS_13inch(String fileName, bool doRefresh) {
 
          // Hardware LUT conversion
          for (int i = 0; i < linesPerChunk * bytesPerHalfLine; i++) {
-            uint8_t low = getColor(chunkBuffer[i] & 0x0F);
-            uint8_t high = getColor(chunkBuffer[i] >> 4);
+            const int row = i / bytesPerHalfLine;
+            const int byteInHalf = i % bytesPerHalfLine;
+            const int screenX = half * (physWidth / 2) + byteInHalf * 2;
+            const int screenY = yImageStart + row;
+            uint8_t lowNibble = chunkBuffer[i] & 0x0F;
+            uint8_t highNibble = chunkBuffer[i] >> 4;
+            if (overlayCanvas) {
+               const int maskX = screenX - IMAGE_ERROR_STREAM_LEFT;
+               const int maskY = screenY - IMAGE_ERROR_OVERLAY_TOP;
+               if (overlayBackgroundCanvas->getPixel(maskX, maskY))
+                  highNibble = 6;
+               if (overlayBackgroundCanvas->getPixel(maskX + 1, maskY))
+                  lowNibble = 6;
+               if (overlayCanvas->getPixel(maskX, maskY))
+                  highNibble = 0;
+               if (overlayCanvas->getPixel(maskX + 1, maskY))
+                  lowNibble = 0;
+            }
+            uint8_t low = getColor(lowNibble);
+            uint8_t high = getColor(highNibble);
             // uint8_t raw = chunkBuffer[i];
             chunkBuffer[i] = (high << 4) | low;
          }
@@ -562,11 +677,11 @@ int setImageFromFS_13inch(String fileName, bool doRefresh) {
    return 0;
 }
 
-int setImageFromFS(String fileName, bool doRefresh) {
+int setImageFromFS(String fileName, bool doRefresh, bool errorOverlay) {
 #ifdef EPD_TYPE_13INCH
-   int result = setImageFromFS_13inch(fileName, doRefresh);
+   int result = setImageFromFS_13inch(fileName, doRefresh, errorOverlay);
 #else
-   int result = setImageFromFS_7inch(fileName);
+   int result = setImageFromFS_7inch(fileName, errorOverlay);
 #endif
    // Stable marker line for the HIL testbench (0 = image shown, <0 = error)
    Serial.printf("[EPD] Set Image Done: %d\n", result);

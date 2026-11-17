@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <nvs.h>
 // #include <SD_MMC.h>
 #include "Adafruit_GFX.h"
 #include "EEPROM.h"
@@ -125,6 +126,7 @@
 #define DISPLAY_SETUP_HINT 1 // "not set up yet"
 #define DISPLAY_ERROR_TEXT 2 // "picture download failed"
 #define DISPLAY_BATTERY_EMPTY 3
+#define DISPLAY_ERROR_OVERLAY 4
 
 #define BAT_OFF_VALUE 4000 // mV (4 cells): below this the frame only sleeps when it runs on batteries
 
@@ -164,7 +166,9 @@ Settings settings = {
     .settingsLastModified = "",
     .autoRotation = true,
     .forceDownload = false,
-    .skipSetupMode = false};
+    .skipSetupMode = false,
+    .requireImageDigest = false,
+    .activeSlot = 0};
 
 SystemData systemData = {
     .wakeupCause = SYSTEM_RESET,
@@ -241,12 +245,33 @@ bool isOrientUpdate = false;
 uint32_t lastDownloadedBytes = 0;
 int serverSleepSeconds = 0;
 uint32_t serverSleepReceivedMs = 0;
+bool secondaryImageSlotAvailable = false;
+static uint8_t desiredPresentation = DISPLAY_PICTURE;
+static uint8_t renderedPresentation = DISPLAY_PICTURE;
+static bool renderPending = true;
+static bool presentationStateInitialized = false;
 constexpr uint32_t IMAGE_SLOT_SIZE = (EPD_WIDTH * EPD_HEIGHT / 2) + 4096;
+constexpr char IMAGE_SLOT_A_NAME[] = "tmp.bmp";
+constexpr char IMAGE_SLOT_B_NAME[] = "tmp_b.bmp";
+constexpr char DOWNLOAD_SLOT_NAME[] = "tmp_raw.bin";
+static const char *imageSlotName(uint8_t slot) {
+   return slot == 1 ? IMAGE_SLOT_B_NAME : IMAGE_SLOT_A_NAME;
+}
+
+static const char *activeImageSlotName() {
+   return imageSlotName(settings.activeSlot);
+}
+
+static uint8_t candidateImageSlot() {
+   return secondaryImageSlotAvailable ? (settings.activeSlot == 0 ? 1 : 0) : settings.activeSlot;
+}
+
 int16_t err_curr[IMG_WIDTH * 3];
 int16_t err_next[IMG_WIDTH * 3];
 char CLIENT_ID[20];
 uint8_t *bleWriteBuffer = nullptr;
 
+static uint32_t alignFlashAddress(uint32_t address, uint32_t blockSize);
 void ledBlink(int timeout, bool on, int dimValue = 100);
 void debugFS(void);
 bool BleInit(String deviceId, bool enable);
@@ -264,7 +289,7 @@ int calculateSleepDuration(int defaultTimeout, bool forceReset, bool getDataOnly
 bool resetAll(bool resetWifi);
 wakeup_reason_t getWakeupReason();
 void runSetupMode();
-int processHttpDownload(String fileName);
+int processHttpDownload();
 bool sdInit(void);
 void accUpdateOrient();
 
@@ -549,53 +574,52 @@ void discardFlashSlot(SerialFlashFile &file) {
    }
 }
 
-bool prepareFlashSlot(const char *name, uint32_t requiredSize, SerialFlashFile &outFile, bool eraseSlot = true) {
+bool openSlot(const char *name, uint32_t requiredSize, SerialFlashFile &outFile) {
    prepareSpiBusForFlash();
-   uint32_t targetSize = (requiredSize > IMAGE_SLOT_SIZE) ? requiredSize : IMAGE_SLOT_SIZE;
    if (!waitFlashReady())
       return false;
    outFile = SerialFlash.open(name);
-   if (!outFile || outFile.size() < targetSize) {
-      if (outFile) {
-         SerialFlash.remove(outFile);
+   if (!outFile || requiredSize == 0 || outFile.size() < requiredSize) {
+      if (outFile)
          outFile.close();
-      }
-      if (!SerialFlash.createErasable(name, targetSize)) {
-         Serial.println("[FLASH] Slot allocation failed, resetting SerialFlash directory...");
-         SerialFlash.eraseBlock(0);
-         if (!waitFlashReady())
-            return false;
-         if (strcmp(name, "tmp.bmp") != 0) {
-            SerialFlash.createErasable("tmp.bmp", IMAGE_SLOT_SIZE);
-            SerialFlashFile picture = SerialFlash.open("tmp.bmp");
-            if (picture) {
-               SerialFlash.eraseBlock(picture.getFlashAddress());
-               if (!waitFlashReady())
-                  return false;
-            }
-         }
-         if (!SerialFlash.createErasable(name, targetSize)) {
-            Serial.println("[FLASH] ERROR: Failed to allocate SerialFlash slot!");
-            return false;
-         }
-      }
-      outFile = SerialFlash.open(name);
-   }
-   if (!outFile)
+      outFile = SerialFlashFile();
+      Serial.printf("[FLASH] Required slot is missing or too small: %s (%u bytes required).\n", name, requiredSize);
       return false;
-   uint32_t bs = SerialFlash.blockSize();
-   if (bs == 0)
-      bs = 65536;
-   uint32_t baseAddr = outFile.getFlashAddress();
-   uint32_t totalLen = outFile.size();
-   for (uint32_t off = 0; eraseSlot && off < totalLen; off += bs) {
-      if (!waitFlashReady())
-         return false;
-      SerialFlash.eraseBlock(baseAddr + off);
-      if (!waitFlashReady())
-         return false;
    }
    outFile.seek(0);
+   return true;
+}
+
+static bool openImageSlot(const char *name, SerialFlashFile &outFile) {
+   const uint32_t blockSize = SerialFlash.blockSize();
+   const uint32_t requiredSize = alignFlashAddress(IMAGE_SLOT_SIZE, blockSize);
+   if (requiredSize == 0 || !openSlot(name, requiredSize, outFile))
+      return false;
+   if (outFile.size() != requiredSize || outFile.getFlashAddress() % blockSize != 0) {
+      Serial.printf("[FLASH] Image slot layout is invalid: %s.\n", name);
+      outFile.close();
+      outFile = SerialFlashFile();
+      return false;
+   }
+   return true;
+}
+
+static bool eraseSlotContents(SerialFlashFile &file, uint32_t eraseLength) {
+   const uint32_t blockSize = SerialFlash.blockSize();
+   if (!file || blockSize == 0 || file.getFlashAddress() == 0 || file.getFlashAddress() % blockSize != 0 ||
+       eraseLength == 0 || eraseLength > file.size() || eraseLength % blockSize != 0) {
+      Serial.println("[FLASH] Refusing to erase an invalid or unaligned slot range.");
+      return false;
+   }
+   const uint32_t baseAddress = file.getFlashAddress();
+   for (uint32_t offset = 0; offset < eraseLength; offset += blockSize) {
+      if (!waitFlashReady())
+         return false;
+      SerialFlash.eraseBlock(baseAddress + offset);
+      if (!waitFlashReady())
+         return false;
+   }
+   file.seek(0);
    return true;
 }
 
@@ -604,32 +628,24 @@ struct RawSlot
    uint32_t written = 0;       // bytes of the file stored so far
    uint32_t erased = 0;        // bytes from the start of the slot that are erased
    uint32_t blockSize = 65536; // erase unit of the flash
+   uint32_t capacity = 0;      // maximum payload bytes allowed in the download slot
    bool overflow = false;      // the file is larger than the slot
 };
 RawSlot rawSlot;
 
 static uint32_t downloadSlotSize() {
-   uint8_t id[5] = {0, 0, 0, 0, 0};
-   SerialFlash.readID(id);
-   const uint32_t capacity = SerialFlash.capacity(id);
-   uint32_t bs = SerialFlash.blockSize();
-   if (bs == 0)
-      bs = 65536;
-   // the flash also holds the directory (first block) and the picture slot (tmp.bmp)
-   const uint32_t reserved = bs + ((IMAGE_SLOT_SIZE + bs - 1) / bs) * bs;
-   uint32_t size = (capacity > reserved) ? ((capacity - reserved) / bs) * bs : 0;
-   if (size > MAX_DOWNLOAD_SIZE)
-      size = MAX_DOWNLOAD_SIZE;
-   if (size < IMAGE_SLOT_SIZE)
-      size = IMAGE_SLOT_SIZE;
-   return size;
+   SerialFlashFile downloadSlot = SerialFlash.open(DOWNLOAD_SLOT_NAME);
+   if (!downloadSlot)
+      return 0;
+   return min(downloadSlot.size(), (uint32_t)MAX_DOWNLOAD_SIZE);
 }
 
-static void rawSlotBegin() {
+static void rawSlotBegin(uint32_t capacity) {
    rawSlot = RawSlot();
    const uint32_t bs = SerialFlash.blockSize();
    if (bs != 0)
       rawSlot.blockSize = bs;
+   rawSlot.capacity = min(capacity, saveFile.size());
    saveFile.seek(0);
 }
 
@@ -637,7 +653,7 @@ static void rawSlotBegin() {
 static bool rawSlotWrite(const uint8_t *data, uint32_t len) {
    if (len == 0)
       return true;
-   if (len > saveFile.size() - rawSlot.written) {
+   if (rawSlot.written > rawSlot.capacity || len > rawSlot.capacity - rawSlot.written) {
       rawSlot.overflow = true;
       return false;
    }
@@ -655,11 +671,14 @@ static bool rawSlotWrite(const uint8_t *data, uint32_t len) {
    return true;
 }
 
-bool hasValidFlashImage(const char *name = "tmp.bmp") {
+bool hasValidFlashImage(const char *name) {
    SerialFlashFile f = SerialFlash.open(name);
    uint8_t magic[2] = {0xFF, 0xFF};
-   return f && f.size() >= (uint32_t)(EPD_WIDTH * EPD_HEIGHT / 2) &&
-          f.read(magic, 2) == 2 && !(magic[0] == 0xFF && magic[1] == 0xFF);
+   const bool valid = f && f.size() >= IMAGE_SLOT_SIZE &&
+                      f.read(magic, 2) == 2 && !(magic[0] == 0xFF && magic[1] == 0xFF);
+   if (f)
+      f.close();
+   return valid;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,14 +701,24 @@ struct ImageConversion
 };
 ImageConversion conv;
 
+static bool writeRasterBytes(const uint8_t *data, uint32_t length) {
+   if (!rawOutFile || length == 0 || rawOutFile.write(data, length) != length) {
+      Serial.println("[FLASH] Raster write failed.");
+      return false;
+   }
+   return waitFlashReady();
+}
+
 // Writes white display rows until rowsWritten reaches untilRow.
-static void convWriteWhiteRows(int untilRow) {
+static bool convWriteWhiteRows(int untilRow) {
    uint8_t row[IMG_WIDTH / 2];
    memset(row, 0x66, sizeof(row));
    while (conv.rowsWritten < untilRow && conv.rowsWritten < IMG_HEIGHT) {
-      rawOutFile.write(row, sizeof(row));
+      if (!writeRasterBytes(row, sizeof(row)))
+         return false;
       conv.rowsWritten++;
    }
+   return true;
 }
 
 static void convRelease() {
@@ -734,15 +763,18 @@ static bool convBegin(int pictureW, int pictureH) {
    memset(err_next, 0, sizeof(err_next));
    Serial.printf("[IMAGE] Picture %dx%d -> %dx%d on the %dx%d display\n", pictureW, pictureH, outW, outH, IMG_WIDTH, IMG_HEIGHT);
 
-   convWriteWhiteRows((IMG_HEIGHT - outH) / 2);
+   if (!convWriteWhiteRows((IMG_HEIGHT - outH) / 2)) {
+      convRelease();
+      return false;
+   }
    return true;
 }
 
 // Dithers the picture row in conv.rowRgb (Floyd-Steinberg) and writes it as one display row.
 // The error is only spread inside the picture, so the white margin stays clean.
-static void convWriteRow() {
+static bool convWriteRow() {
    if (conv.rowsWritten >= IMG_HEIGHT)
-      return;
+      return false;
 
    uint8_t out_row[IMG_WIDTH / 2];
    memset(out_row, 0x66, sizeof(out_row));
@@ -800,18 +832,21 @@ static void convWriteRow() {
          out_row[px / 2] = (out_row[px / 2] & 0xF0) | (best & 0x0F);
    }
 
-   rawOutFile.write(out_row, sizeof(out_row));
+   if (!writeRasterBytes(out_row, sizeof(out_row)))
+      return false;
    memcpy(err_curr, err_next, sizeof(err_curr));
    memset(err_next, 0, sizeof(err_next));
    conv.rowsWritten++;
+   return true;
 }
 
 // Writes the white rows below the picture and closes the display image.
-static void convFinish() {
-   convWriteWhiteRows(IMG_HEIGHT);
+static bool convFinish() {
+   const bool rowsWritten = convWriteWhiteRows(IMG_HEIGHT);
    convRelease();
-   waitFlashReady();
+   const bool flashReady = waitFlashReady();
    rawOutFile.close();
+   return rowsWritten && flashReady && conv.rowsWritten == IMG_HEIGHT;
 }
 
 // --- JPEG ---
@@ -826,7 +861,7 @@ int jpgDecW = 0;              // size the decoder delivers (after its own 1/2, 1
 int jpgDecH = 0;
 int jpgNextRow = 0; // next picture row to write
 
-void jpgFlushStrip() {
+bool jpgFlushStrip() {
    for (int y = 0; y < jpgStripH; y++) {
       const int decY = jpgStripY + y;
       // every picture row that takes its pixels from this decoded row
@@ -839,16 +874,20 @@ void jpgFlushStrip() {
             *dst++ = (c & 0x07E0) >> 3;
             *dst++ = (c & 0x001F) << 3;
          }
-         convWriteRow();
+         if (!convWriteRow()) {
+            return false;
+         }
          jpgNextRow++;
       }
    }
    jpgStripH = 0;
+   return true;
 }
 
 int JPEGDraw(JPEGDRAW *pDraw) {
    if (pDraw->y != jpgStripY && jpgStripH > 0) {
-      jpgFlushStrip();
+      if (!jpgFlushStrip())
+         return 0;
    }
    jpgStripY = pDraw->y;
 
@@ -879,16 +918,18 @@ int JPEGDraw(JPEGDRAW *pDraw) {
 }
 
 static bool convertJpeg(const char *rawFileName, const char *outFileName) {
-   if (!prepareFlashSlot(outFileName, IMAGE_SLOT_SIZE, rawOutFile))
-      return false;
    if (!jpeg.open(rawFileName, myOpen, myClose, myRead, mySeek, JPEGDraw)) {
       Serial.printf("[IMAGE] JPEG not readable (decoder error %d)\n", jpeg.getLastError());
-      discardFlashSlot(rawOutFile);
       return false;
    }
 
    const int w = jpeg.getWidth();
    const int h = jpeg.getHeight();
+   if (w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
+       !openImageSlot(outFileName, rawOutFile) || !eraseSlotContents(rawOutFile, rawOutFile.size())) {
+      jpeg.close();
+      return false;
+   }
    bool ok = convBegin(w, h);
    int shift = 0; // the decoder can deliver 1/2, 1/4 or 1/8 of the size
 
@@ -923,7 +964,7 @@ static bool convertJpeg(const char *rawFileName, const char *outFileName) {
       jpgNextRow = 0;
       ok = (jpeg.decode(0, 0, scaleOptions[shift]) == 1);
       if (ok)
-         jpgFlushStrip();
+         ok = jpgFlushStrip();
       else
          Serial.printf("[IMAGE] JPEG decoding failed (decoder error %d)\n", jpeg.getLastError());
    }
@@ -937,32 +978,36 @@ static bool convertJpeg(const char *rawFileName, const char *outFileName) {
       discardFlashSlot(rawOutFile);
       return false;
    }
-   convFinish();
-   return true;
+   return convFinish();
 }
 
 // --- BMP and raw display images ---
 
 // Copies a file that already is a display image (pre-dithered BMP of the display size, raw payload).
 static bool copyDisplayImage(SerialFlashFile &inFile, const char *outFileName) {
-   if (!prepareFlashSlot(outFileName, IMAGE_SLOT_SIZE, rawOutFile))
+   const uint32_t remainingBytes = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size())
+                                       ? lastDownloadedBytes
+                                       : (inFile.size() == (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2 ? inFile.size() : 0);
+   if (remainingBytes == 0 || remainingBytes > IMAGE_SLOT_SIZE)
+      return false;
+   if (!openImageSlot(outFileName, rawOutFile) || !eraseSlotContents(rawOutFile, rawOutFile.size()))
       return false;
    inFile.seek(0);
    uint8_t buf[2048];
 
-   uint32_t remaining = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size()) ? lastDownloadedBytes : inFile.size();
-   if (remaining > IMAGE_SLOT_SIZE)
-      remaining = IMAGE_SLOT_SIZE;
+   uint32_t remaining = remainingBytes;
+   bool ok = true;
    while (remaining > 0) {
-      const uint32_t bytesRead = inFile.read(buf, (remaining < sizeof(buf)) ? remaining : sizeof(buf));
-      if (bytesRead == 0)
+      const uint32_t chunk = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
+      if (inFile.read(buf, chunk) != chunk || !writeRasterBytes(buf, chunk)) {
+         ok = false;
          break;
-      rawOutFile.write(buf, bytesRead);
-      remaining -= bytesRead;
+      }
+      remaining -= chunk;
    }
-   waitFlashReady();
+   ok = ok && remaining == 0 && waitFlashReady();
    rawOutFile.close();
-   return true;
+   return ok;
 }
 
 static uint16_t readLe16(const uint8_t *p) {
@@ -997,7 +1042,9 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
    }
 
    const uint32_t stride = (((uint32_t)width * bpp + 31) / 32) * 4; // rows are padded to 4 bytes
-   const uint32_t fileLen = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size()) ? lastDownloadedBytes : inFile.size();
+   const uint32_t fileLen = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size())
+                                ? lastDownloadedBytes
+                                : (inFile.size() == (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2 ? inFile.size() : 0);
    if ((uint64_t)pixelOffset + (uint64_t)stride * height > fileLen) {
       Serial.println("[IMAGE] BMP is incomplete");
       return false;
@@ -1031,7 +1078,7 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
       Serial.println("[IMAGE] OOM allocating BMP row buffer");
       return false;
    }
-   if (!prepareFlashSlot(outFileName, IMAGE_SLOT_SIZE, rawOutFile)) {
+   if (!openImageSlot(outFileName, rawOutFile) || !eraseSlotContents(rawOutFile, rawOutFile.size())) {
       free(srcRow);
       return false;
    }
@@ -1068,7 +1115,8 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
             *dst++ = p[0];
          }
       }
-      convWriteRow();
+      if (!convWriteRow())
+         ok = false;
    }
    free(srcRow);
 
@@ -1077,8 +1125,75 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
       discardFlashSlot(rawOutFile);
       return false;
    }
-   convFinish();
+   return convFinish();
+}
+
+static bool validateRawDisplayImage(SerialFlashFile &inFile) {
+   const uint32_t fileLen = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size()) ? lastDownloadedBytes : inFile.size();
+   const uint32_t expectedBytes = (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2;
+   if (fileLen != expectedBytes) {
+      Serial.printf("[IMAGE] Raw payload size mismatch (%lu / %lu bytes).\n", (unsigned long)fileLen, (unsigned long)expectedBytes);
+      return false;
+   }
+   inFile.seek(0);
+   uint8_t buffer[2048];
+   uint32_t remaining = fileLen;
+   while (remaining > 0) {
+      const uint32_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+      if (inFile.read(buffer, chunk) != chunk)
+         return false;
+      for (uint32_t i = 0; i < chunk; i++) {
+         const uint8_t high = buffer[i] >> 4;
+         const uint8_t low = buffer[i] & 0x0F;
+         if ((high != 0 && high != 1 && high != 2 && high != 3 && high != 5 && high != 6) ||
+             (low != 0 && low != 1 && low != 2 && low != 3 && low != 5 && low != 6)) {
+            Serial.println("[IMAGE] Raw payload contains an unsupported color code.");
+            return false;
+         }
+      }
+      remaining -= chunk;
+   }
+   inFile.seek(0);
    return true;
+}
+
+static bool copyStagedImageToSlot(const char *sourceName, const char *outFileName, uint32_t sourceBytes) {
+   SerialFlashFile source = SerialFlash.open(sourceName);
+   if (!source)
+      return false;
+   const uint32_t expectedBytes = (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2;
+   if (sourceBytes != expectedBytes || sourceBytes > source.size()) {
+      source.close();
+      return false;
+   }
+   const uint32_t savedDownloadedBytes = lastDownloadedBytes;
+   lastDownloadedBytes = sourceBytes;
+   const bool valid = validateRawDisplayImage(source);
+   lastDownloadedBytes = savedDownloadedBytes;
+   if (!valid) {
+      source.close();
+      return false;
+   }
+   if (!openImageSlot(outFileName, rawOutFile) || !eraseSlotContents(rawOutFile, rawOutFile.size())) {
+      source.close();
+      return false;
+   }
+   source.seek(0);
+   uint8_t buffer[2048];
+   uint32_t remaining = sourceBytes;
+   bool ok = true;
+   while (remaining > 0) {
+      const uint32_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+      if (source.read(buffer, chunk) != chunk || rawOutFile.write(buffer, chunk) != chunk) {
+         ok = false;
+         break;
+      }
+      remaining -= chunk;
+   }
+   ok = ok && remaining == 0 && waitFlashReady();
+   source.close();
+   rawOutFile.close();
+   return ok;
 }
 
 bool processImageFile(const char *rawFileName, const char *outFileName) {
@@ -1100,7 +1215,7 @@ bool processImageFile(const char *rawFileName, const char *outFileName) {
    }
    else if (magic[0] == 0x66 && magic[1] == 0x66) {
       Serial.println("[IMAGE] Raw dithered payload detected.");
-      ok = copyDisplayImage(inFile, outFileName);
+      ok = validateRawDisplayImage(inFile) && copyDisplayImage(inFile, outFileName);
    }
 
    inFile.close();
@@ -1378,6 +1493,8 @@ void saveSettingsToFlash(int startAddr) {
    writeStringToFlash(settings.settingsUrl.c_str(), startAddr + 555, maxLen, false);
    writeStringToFlash(settings.settingsLastModified.c_str(), startAddr + 685, maxLen, false);
    writeIntToFlash(settings.autoRotation, startAddr + 815, false);
+   writeIntToFlash(settings.requireImageDigest ? 1 : 0, startAddr + 820, false);
+   writeIntToFlash(settings.activeSlot == 1 ? 1 : 0, startAddr + 824, false);
    EEPROM.commit();
    Serial.println("[MEM] Settings saved to EEPROM");
 }
@@ -1400,6 +1517,9 @@ void restoreSettingsToFlash(int startAddr) {
    settings.settingsLastModified = readStringFromFlash(startAddr + 685);
    int autoRot = readIntFromFlash(startAddr + 815);
    settings.autoRotation = (autoRot == 0) ? false : true;
+   settings.requireImageDigest = readIntFromFlash(startAddr + 820) == 1;
+   const int activeSlot = readIntFromFlash(startAddr + 824);
+   settings.activeSlot = (activeSlot == 1) ? 1 : 0;
    Serial.println("[MEM] Settings restored from EEPROM");
    if (DEBUG_FLAG) {
       Serial.printf("[MEM] Settings - BatteryWarning: %d WifiWarning: %d SleepDisabled: %d ImageMode: %d MotionWakeup: %d ChargerMode: %d\n", settings.showBatteryWarning, settings.showWifiWarning, settings.sleepDisabled, settings.imageMode, settings.motionWakeup, settings.chargerMode);
@@ -1734,7 +1854,7 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks
                bleUploadError = true;
                return;
             }
-            if (!prepareFlashSlot("tmp.bmp", IMAGE_SLOT_SIZE, bleFile)) {
+            if (!openSlot(DOWNLOAD_SLOT_NAME, IMAGE_SLOT_SIZE, bleFile) || !eraseSlotContents(bleFile, bleFile.size())) {
                free(bleWriteBuffer);
                bleWriteBuffer = nullptr;
                bleUploadError = true;
@@ -1835,12 +1955,20 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks
                   bleUploadError = true;
                }
                else {
-                  bleFinalFlashCrc = flashCrc;
+                  const uint8_t targetSlot = candidateImageSlot();
                   bleFile.close();
                   bleFile = SerialFlashFile();
-                  settings.imageMode = 0;
-                  settings.lastModified = "";
-                  saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+                  if (copyStagedImageToSlot(DOWNLOAD_SLOT_NAME, imageSlotName(targetSlot), bleBytesReceived)) {
+                     bleFinalFlashCrc = flashCrc;
+                     settings.activeSlot = targetSlot;
+                     settings.imageMode = 0;
+                     settings.lastModified = "";
+                     saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+                  }
+                  else {
+                     Serial.println("[BLE] ERROR: Could not validate/copy staged image to the inactive slot.");
+                     bleUploadError = true;
+                  }
                }
             }
             else {
@@ -2255,7 +2383,7 @@ int downloadAndSaveFile(String fileName, String url) {
       Serial.println("[DL] HTTP Auth enabled");
    }
 
-   bool canSkipIfUnchanged = !settings.forceDownload && hasValidFlashImage("tmp.bmp");
+   bool canSkipIfUnchanged = !settings.forceDownload && hasValidFlashImage(activeImageSlotName());
    if (canSkipIfUnchanged && settings.lastModified.length() > 0) {
       if (settings.lastModified.startsWith("etag:"))
          http.addHeader("If-None-Match", settings.lastModified.substring(5));
@@ -2293,8 +2421,10 @@ int downloadAndSaveFile(String fileName, String url) {
             // Does not fit into EEPROM; a truncated validator would never match.
             validator = (lastMod.length() <= MAX_SETTING_STRING_LEN) ? lastMod : String("");
          }
-         if (canSkipIfUnchanged && validator.length() > 0 &&
-             (validator == settings.lastModified || lastMod == settings.lastModified)) {
+         const bool validatorMatches = settings.lastModified.startsWith("etag:")
+                                           ? (etag.length() > 0 && ("etag:" + etag) == settings.lastModified)
+                                           : (etag.length() == 0 && lastMod.length() > 0 && lastMod == settings.lastModified);
+         if (canSkipIfUnchanged && validator.length() > 0 && validatorMatches) {
             Serial.println("[DL] File not modified, skipping download.");
             if (srvSleep >= 60 && srvSleep <= 86400) {
                serverSleepSeconds = srvSleep;
@@ -2312,17 +2442,18 @@ int downloadAndSaveFile(String fileName, String url) {
          if (chunked)
             len = -1; // the end is marked by the last chunk
 
-         if (!prepareFlashSlot(fileName.c_str(), downloadSlotSize(), saveFile, false)) {
+         const uint32_t downloadCapacity = downloadSlotSize();
+         if (!openSlot(fileName.c_str(), downloadCapacity, saveFile)) {
             http.end();
             return DL_FLASH_ERROR;
          }
-         if (len > 0 && (uint32_t)len > saveFile.size()) {
-            Serial.printf("[DL] File too large (%d bytes, at most %u), not downloaded.\n", len, (unsigned)saveFile.size());
+         if (len > 0 && (uint32_t)len > downloadCapacity) {
+            Serial.printf("[DL] File too large (%d bytes, at most %u), not downloaded.\n", len, (unsigned)downloadCapacity);
             saveFile.close();
             http.end();
             return DL_TOO_LARGE;
          }
-         rawSlotBegin();
+         rawSlotBegin(downloadCapacity);
          Serial.printf("[DL] Download Size: %d%s\n", len, chunked ? " (chunked)" : "");
          int buff_size = 2048;
          unsigned char *buff = (unsigned char *)malloc(buff_size);
@@ -2488,6 +2619,193 @@ void debugFS() {
 #if DEBUG
    Serial.printf("[MAIN] SPIFFS usage %d/%d heap free: %d/%d\n", SPIFFS.usedBytes(), SPIFFS.totalBytes(), ESP.getFreeHeap(), ESP.getHeapSize());
 #endif
+}
+
+void logStorageDiagnostics() {
+#if DEBUG
+   uint8_t id[5] = {0, 0, 0, 0, 0};
+   SerialFlash.readID(id);
+   const uint32_t capacity = SerialFlash.capacity(id);
+   const uint32_t blockSize = SerialFlash.blockSize();
+   Serial.printf("[STORAGE] SerialFlash JEDEC ID: %02X %02X %02X %02X %02X\n", id[0], id[1], id[2], id[3], id[4]);
+   Serial.printf("[STORAGE] SerialFlash capacity: %u bytes, erase block: %u bytes\n", capacity, blockSize);
+
+   uint64_t lastAllocatedEnd = 0;
+   SerialFlash.opendir();
+   char filename[64];
+   uint32_t listedSize = 0;
+   while (SerialFlash.readdir(filename, sizeof(filename), listedSize)) {
+      SerialFlashFile file = SerialFlash.open(filename);
+      if (!file) {
+         Serial.printf("[STORAGE] File unavailable: %s (listed size %u)\n", filename, listedSize);
+         continue;
+      }
+      const uint32_t address = file.getFlashAddress();
+      const uint32_t size = file.size();
+      const uint64_t end = (uint64_t)address + size;
+      if (end > lastAllocatedEnd)
+         lastAllocatedEnd = end;
+      Serial.printf("[STORAGE] File %s: address %u, size %u, end %llu\n", filename, address, size,
+                    (unsigned long long)end);
+   }
+   const uint32_t tailFree = (capacity > lastAllocatedEnd) ? (uint32_t)(capacity - lastAllocatedEnd) : 0;
+   Serial.printf("[STORAGE] Last allocated end: %llu, free tail: %u bytes\n",
+                 (unsigned long long)lastAllocatedEnd, tailFree);
+
+   nvs_stats_t nvsStats = {};
+   const esp_err_t nvsResult = nvs_get_stats(NULL, &nvsStats);
+   if (nvsResult == ESP_OK) {
+      Serial.printf("[STORAGE] NVS entries: used %u, free %u, available %u, total %u, namespaces %u\n",
+                    (unsigned)nvsStats.used_entries, (unsigned)nvsStats.free_entries,
+                    (unsigned)nvsStats.available_entries, (unsigned)nvsStats.total_entries,
+                    (unsigned)nvsStats.namespace_count);
+   }
+   else {
+      Serial.printf("[STORAGE] NVS statistics unavailable: %s (0x%x)\n", esp_err_to_name(nvsResult), nvsResult);
+   }
+#endif
+}
+
+static uint32_t alignFlashAddress(uint32_t address, uint32_t blockSize) {
+   if (blockSize == 0)
+      return 0;
+   const uint64_t aligned = ((uint64_t)address + blockSize - 1) / blockSize * blockSize;
+   return (aligned <= UINT32_MAX) ? (uint32_t)aligned : 0;
+}
+
+static bool findSafeSerialFlashAppendAddress(uint32_t capacity, uint32_t blockSize, uint32_t &appendAddress) {
+   if (capacity == 0 || blockSize == 0)
+      return false;
+
+   uint32_t directoryHeader[2] = {0, 0};
+   SerialFlash.read(0, directoryHeader, sizeof(directoryHeader));
+   if (directoryHeader[0] != 0xFA96554C)
+      return false;
+
+   const uint32_t maxFiles = directoryHeader[1] & 0xFFFF;
+   if (maxFiles == 0)
+      return false;
+   const uint32_t fileInfoBase = 8 + maxFiles * 2;
+   uint32_t firstFreeIndex = maxFiles;
+   uint64_t highestEnd = 0;
+
+   for (uint32_t index = 0; index < maxFiles; index++) {
+      uint16_t hash = 0xFFFF;
+      SerialFlash.read(8 + index * sizeof(hash), &hash, sizeof(hash));
+      if (hash == 0xFFFF) {
+         if (firstFreeIndex == maxFiles)
+            firstFreeIndex = index;
+         continue;
+      }
+      if (firstFreeIndex != maxFiles)
+         return false;
+
+      uint32_t fileInfo[3] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+      SerialFlash.read(fileInfoBase + index * 10, fileInfo, 10);
+      const uint64_t fileEnd = (uint64_t)fileInfo[0] + fileInfo[1];
+      if (fileInfo[0] < blockSize || fileInfo[0] >= capacity || fileEnd > capacity || fileEnd <= fileInfo[0])
+         return false;
+      highestEnd = max(highestEnd, fileEnd);
+   }
+
+   if (firstFreeIndex == 0 || firstFreeIndex == maxFiles)
+      return false;
+
+   uint32_t previousEntry[3] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+   SerialFlash.read(fileInfoBase + (firstFreeIndex - 1) * 10, previousEntry, 10);
+   const uint64_t previousEntryEnd = (uint64_t)previousEntry[0] + previousEntry[1];
+   if (previousEntry[0] < blockSize || previousEntryEnd > capacity || previousEntryEnd <= previousEntry[0] ||
+       previousEntryEnd != highestEnd)
+      return false;
+
+   appendAddress = alignFlashAddress((uint32_t)previousEntryEnd, blockSize);
+   return appendAddress >= previousEntryEnd && appendAddress < capacity;
+}
+
+static bool imageSlotDoesNotOverlap(const char *name, uint32_t start, uint32_t length) {
+   SerialFlashFile file = SerialFlash.open(name);
+   if (!file)
+      return true;
+   const uint64_t end = (uint64_t)start + length;
+   const uint64_t otherStart = file.getFlashAddress();
+   const uint64_t otherEnd = otherStart + file.size();
+   return end <= otherStart || otherEnd <= start;
+}
+
+static void initializeTransitionImageSlotB() {
+   secondaryImageSlotAvailable = false;
+   prepareSpiBusForFlash();
+
+   uint8_t id[5] = {0, 0, 0, 0, 0};
+   SerialFlash.readID(id);
+   const uint32_t capacity = SerialFlash.capacity(id);
+   uint32_t blockSize = SerialFlash.blockSize();
+   if (blockSize == 0 || capacity == 0) {
+      Serial.println("[FLASH] Slot B unavailable: external flash geometry is unknown; using single-slot mode.");
+      return;
+   }
+
+   const uint32_t slotAllocationSize = alignFlashAddress(IMAGE_SLOT_SIZE, blockSize);
+   const uint32_t backupAllocationSize = slotAllocationSize;
+   if (slotAllocationSize == 0 || backupAllocationSize == 0) {
+      Serial.println("[FLASH] Slot B unavailable: invalid slot geometry; using single-slot mode.");
+      return;
+   }
+
+   SerialFlashFile slotB = SerialFlash.open(IMAGE_SLOT_B_NAME);
+   if (slotB) {
+      const uint32_t address = slotB.getFlashAddress();
+      const uint32_t size = slotB.size();
+      const uint32_t backupStart = capacity - backupAllocationSize;
+      if (address % blockSize == 0 && size >= slotAllocationSize &&
+          (uint64_t)address + size <= backupStart &&
+          imageSlotDoesNotOverlap(IMAGE_SLOT_A_NAME, address, size) &&
+          imageSlotDoesNotOverlap(DOWNLOAD_SLOT_NAME, address, size)) {
+         secondaryImageSlotAvailable = true;
+         Serial.printf("[FLASH] Slot B available at %u (%u bytes); migration backup reserve starts at %u.\n",
+                       address, size, backupStart);
+      }
+      else {
+         Serial.println("[FLASH] Slot B has an unexpected layout; preserving it and using single-slot mode.");
+      }
+      return;
+   }
+
+   uint32_t appendAddress = 0;
+   if (!findSafeSerialFlashAppendAddress(capacity, blockSize, appendAddress)) {
+      Serial.println("[FLASH] Slot B unavailable: directory allocation order is not safely appendable; using single-slot mode.");
+      return;
+   }
+
+   const uint64_t reserveEnd = (uint64_t)appendAddress + slotAllocationSize + backupAllocationSize;
+   if (reserveEnd > capacity) {
+      Serial.println("[FLASH] Slot B unavailable: insufficient room for slot B and migration backup; using single-slot mode.");
+      return;
+   }
+
+   const uint32_t backupStart = capacity - backupAllocationSize;
+   if ((uint64_t)appendAddress + slotAllocationSize > backupStart) {
+      Serial.println("[FLASH] Slot B unavailable: it would overlap the migration backup reserve; using single-slot mode.");
+      return;
+   }
+
+   Serial.printf("[FLASH] Adding transition slot B at %u (%u bytes).\n", appendAddress, slotAllocationSize);
+   if (!SerialFlash.createErasable(IMAGE_SLOT_B_NAME, IMAGE_SLOT_SIZE)) {
+      Serial.println("[FLASH] Slot B allocation failed; preserving the existing directory and using single-slot mode.");
+      return;
+   }
+
+   slotB = SerialFlash.open(IMAGE_SLOT_B_NAME);
+   if (!slotB || slotB.getFlashAddress() != appendAddress || slotB.size() != slotAllocationSize ||
+       !imageSlotDoesNotOverlap(IMAGE_SLOT_A_NAME, slotB.getFlashAddress(), slotB.size()) ||
+       !imageSlotDoesNotOverlap(DOWNLOAD_SLOT_NAME, slotB.getFlashAddress(), slotB.size())) {
+      Serial.println("[FLASH] Slot B allocation verification failed; it will remain unused and the directory will not be rebuilt.");
+      return;
+   }
+
+   secondaryImageSlotAvailable = true;
+   Serial.printf("[FLASH] Slot B ready at %u (%u bytes); migration backup reserve starts at %u.\n",
+                 slotB.getFlashAddress(), slotB.size(), backupStart);
 }
 
 void sdTest() {
@@ -2997,10 +3315,15 @@ bool resetAll(bool resetWifi) {
    Serial.printf("[MAIN] Reset - WIFI %d \n", resetWifi);
    writeIntToFlash(0, 220);          // restore screen orient to default
    storeSleepTimeMem(DEFAULT_SLEEP); // restore sleep mem store to default
-   if (SerialFlash.exists("tmp.bmp")) {
-      SerialFlashFile f = SerialFlash.open("tmp.bmp");
-      discardFlashSlot(f);
+   const char *imageSlots[] = {IMAGE_SLOT_A_NAME, IMAGE_SLOT_B_NAME};
+   for (const char *slotName : imageSlots) {
+      if (SerialFlash.exists(slotName)) {
+         SerialFlashFile slotFile = SerialFlash.open(slotName);
+         if (slotFile)
+            eraseSlotContents(slotFile, slotFile.size());
+      }
    }
+   settings.activeSlot = 0;
    settings.downloadUrl = "";
    settings.lastModified = "";
    settings.settingsLastModified = "";
@@ -3128,10 +3451,41 @@ static void setDisplayContent(uint8_t content) {
 }
 
 int showStoredImage(const String &fileName) {
+   desiredPresentation = DISPLAY_PICTURE;
+   renderPending = true;
    const int result = setImageFromFS(fileName);
-   if (result == 0)
+   if (result == 0 && waitDisplayComplete(false)) {
       setDisplayContent(DISPLAY_PICTURE);
+      renderedPresentation = DISPLAY_PICTURE;
+      renderPending = false;
+   }
    return result;
+}
+
+static int showImageError(const String &fileName, bool hasPicture) {
+   const uint8_t targetPresentation = hasPicture ? DISPLAY_ERROR_OVERLAY : DISPLAY_ERROR_TEXT;
+   desiredPresentation = targetPresentation;
+   if (!settings.forceDownload && !renderPending && renderedPresentation == targetPresentation)
+      return 0;
+
+   renderPending = true;
+   if (hasPicture) {
+      const int result = setImageFromFS(fileName, true, true);
+      if (result == 0 && waitDisplayComplete(false)) {
+         setDisplayContent(DISPLAY_ERROR_OVERLAY);
+         renderedPresentation = DISPLAY_ERROR_OVERLAY;
+         renderPending = false;
+      }
+      return result;
+   }
+
+   displaySetText("Error: Picture download failed, please try again", false, true);
+   if (!waitDisplayComplete(false))
+      return -1;
+   setDisplayContent(DISPLAY_ERROR_TEXT);
+   renderedPresentation = DISPLAY_ERROR_TEXT;
+   renderPending = false;
+   return 0;
 }
 
 static void showNotice(uint8_t content, const char *text, const char *text2 = "") {
@@ -3140,7 +3494,12 @@ static void showNotice(uint8_t content, const char *text, const char *text2 = ""
       return;
    }
    displaySetText(text, false, true, text2);
+   if (!waitDisplayComplete(false))
+      return;
    setDisplayContent(content);
+   desiredPresentation = content;
+   renderedPresentation = content;
+   renderPending = false;
 }
 
 void runSetupMode() {
@@ -3251,8 +3610,8 @@ void runSetupMode() {
          if (settings.autoRotation) {
             accUpdateOrient();
          }
-         logImageSlotCrc("tmp.bmp");
-         showStoredImage("tmp.bmp");
+         logImageSlotCrc(activeImageSlotName());
+         showStoredImage(activeImageSlotName());
          applyInProgress = false;
       }
 
@@ -3331,12 +3690,17 @@ bool ensureWifi() {
    return !failed;
 }
 
-int processHttpDownload(String fileName) {
+int processHttpDownload() {
    int dlSuccess = 0;
    if (ensureWifi()) {
       dlSuccess = loadImageFromWeb(settings.downloadUrl, "tmp_raw.bin");
       if (dlSuccess == 0) {
-         if (processImageFile("tmp_raw.bin", fileName.c_str())) {
+         const uint8_t targetSlot = candidateImageSlot();
+         const char *targetFileName = imageSlotName(targetSlot);
+         if (processImageFile(DOWNLOAD_SLOT_NAME, targetFileName)) {
+            settings.activeSlot = targetSlot;
+            settings.lastModified = tempLastModified;
+            saveSettingsToFlash(EEPROM_SETTINGS_ADR);
             dlSuccess = 0;
          }
          else {
@@ -3701,6 +4065,8 @@ void setup() {
    powerSupplyDisplay(true);
    prepareSpiBusForFlash();
    SerialFlash.begin(CS_FLASH_PIN, FLASH_SPI_SPEED); // proceed even if begin() fails
+   logStorageDiagnostics();
+   initializeTransitionImageSlotB();
    initEpaperDisplay(SPI);
    powerSupplyDisplay(false);
    chargeMode(settings.chargerMode);
@@ -3767,6 +4133,14 @@ static int retryDelaySeconds(uint8_t failures, int regularSleep) {
 
 void loop() {
 
+   if (!presentationStateInitialized) {
+      const uint8_t storedPresentation = displayContent();
+      renderedPresentation = storedPresentation <= DISPLAY_ERROR_OVERLAY ? storedPresentation : DISPLAY_PICTURE;
+      desiredPresentation = renderedPresentation;
+      renderPending = renderedPresentation == DISPLAY_ERROR_TEXT;
+      presentationStateInitialized = true;
+   }
+
    if (downloadStart) {
       BleInit(CLIENT_ID, false);
       powerSupplyDisplay(true);
@@ -3792,12 +4166,12 @@ void loop() {
       }
 
       delay(200);
-      String fileName = "tmp.bmp";
+      String fileName = activeImageSlotName();
       int dlSuccess = 0;
 
       // Fallback: If in BLE mode but the file is missing and we have a download URL configured, switch to URL mode
       if (settings.imageMode == 0 && !hasValidFlashImage(fileName.c_str()) && settings.downloadUrl.length() > 0) {
-         Serial.println("[IMAGE] BLE mode active but tmp.bmp is missing. Fallback to URL mode.");
+         Serial.printf("[IMAGE] BLE mode active but image slot %s is invalid. Fallback to URL mode.\n", fileName.c_str());
          settings.imageMode = 1;
          saveSettingsToFlash(EEPROM_SETTINGS_ADR);
       }
@@ -3805,6 +4179,7 @@ void loop() {
       if (settings.settingsUrl.length() > 0 && ensureWifi()) {
          fetchRemoteSettings(); // This might change imageMode or downloadUrl!
       }
+      fileName = activeImageSlotName();
 
       const bool canDownload = wifiSettings.ssid.length() > 0 && settings.downloadUrl.length() > 0;
       const bool hasPicture = hasValidFlashImage(fileName.c_str());
@@ -3821,10 +4196,11 @@ void loop() {
       }
 
       if (settings.imageMode == 1) { // URL Mode
-         dlSuccess = processHttpDownload(fileName);
+         dlSuccess = processHttpDownload();
+         fileName = activeImageSlotName();
       }
       else { // BLE Mode (Mode 0)
-         Serial.println("[IMAGE] Using BLE uncompressed tmp.bmp");
+         Serial.printf("[IMAGE] Using BLE uncompressed image slot %s.\n", fileName.c_str());
       }
 
       waitDisplayComplete(false);
@@ -3836,17 +4212,11 @@ void loop() {
             Serial.println("[IMAGE] Image was already applied during setup mode, skipping refresh.");
             setSuccess = 0;
          }
-         else if (dlSuccess == 0 || settings.imageMode == 0) {
+         else if (dlSuccess == 0 || settings.imageMode == 0 ||
+                  renderedPresentation != DISPLAY_PICTURE || renderPending) {
             WiFi.disconnect(true);
             logImageSlotCrc(fileName.c_str());
             setSuccess = showStoredImage(fileName);
-            if (setSuccess == 0 && dlSuccess == 0 && settings.imageMode == 1) {
-               if (settings.lastModified != tempLastModified) {
-                  settings.lastModified = tempLastModified;
-                  saveSettingsToFlash(EEPROM_SETTINGS_ADR);
-               }
-               tempLastModified = "";
-            }
          }
          else {
             Serial.println("[IMAGE] Not rendering, image not modified");
@@ -3854,15 +4224,8 @@ void loop() {
          }
       }
       else {
-         showNotice(DISPLAY_ERROR_TEXT, "Error: Picture download failed, please try again");
-         setSuccess = -1;
-         // The error text has replaced the picture. Forget the validator of the stored picture:
-         // otherwise the next successful request is answered with "not modified" (HTTP 304),
-         // nothing is drawn and the error text stays on the display.
-         if (settings.lastModified.length() > 0) {
-            settings.lastModified = "";
-            saveSettingsToFlash(EEPROM_SETTINGS_ADR);
-         }
+         const int overlayResult = showImageError(fileName, hasPicture);
+         setSuccess = overlayResult == 0 ? -1 : overlayResult;
       }
 
       debugFS();
