@@ -3450,11 +3450,23 @@ static void setDisplayContent(uint8_t content) {
    }
 }
 
-int showStoredImage(const String &fileName) {
+int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
+   bool restoreErrorRegion = false;
+#ifdef EPD_TYPE_13INCH
+   restoreErrorRegion = sourceUnchanged && renderedPresentation == DISPLAY_ERROR_OVERLAY;
+#else
+   (void)sourceUnchanged;
+#endif
    desiredPresentation = DISPLAY_PICTURE;
    renderPending = true;
-   const int result = setImageFromFS(fileName);
-   if (result == 0 && waitDisplayComplete(false)) {
+   if (restoreErrorRegion)
+      Serial.println("[IMAGE] Source unchanged; restoring only the error overlay region.");
+   else
+      logImageSlotCrc(fileName.c_str());
+   const int result = restoreErrorRegion ? restoreImageErrorOverlay(fileName) : setImageFromFS(fileName);
+   if (result == 0) {
+      if (!waitDisplayComplete(false))
+         return -1;
       setDisplayContent(DISPLAY_PICTURE);
       renderedPresentation = DISPLAY_PICTURE;
       renderPending = false;
@@ -3610,7 +3622,6 @@ void runSetupMode() {
          if (settings.autoRotation) {
             accUpdateOrient();
          }
-         logImageSlotCrc(activeImageSlotName());
          showStoredImage(activeImageSlotName());
          applyInProgress = false;
       }
@@ -4215,8 +4226,7 @@ void loop() {
          else if (dlSuccess == 0 || settings.imageMode == 0 ||
                   renderedPresentation != DISPLAY_PICTURE || renderPending) {
             WiFi.disconnect(true);
-            logImageSlotCrc(fileName.c_str());
-            setSuccess = showStoredImage(fileName);
+            setSuccess = showStoredImage(fileName, dlSuccess == DL_NOT_MODIFIED);
          }
          else {
             Serial.println("[IMAGE] Not rendering, image not modified");

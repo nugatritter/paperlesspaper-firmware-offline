@@ -68,8 +68,9 @@ void displaySetOverlayOption(DisplayInfoKey key, bool value);
 void displayTypeDetect();
 void displayOverlays(DisplayType &display, DisplayInfo displayData, bool invertColors, bool fullcolor = false);
 int setImageFromFS_7inch(String fileName, bool errorOverlay = false);
-int setImageFromFS_13inch(String fileName, bool doRefresh = true, bool errorOverlay = false);
+int setImageFromFS_13inch(String fileName, bool doRefresh = true, bool errorOverlay = false, bool restoreErrorOverlay = false);
 int setImageFromFS(String fileName, bool doRefresh = true, bool errorOverlay = false);
+int restoreImageErrorOverlay(String fileName);
 void displayWipe(bool quick);
 void displaySetText(String info, bool isBlackboard, bool quickRefresh = true, String info2 = ""); // info2: second, smaller line
 bool waitDisplayComplete(bool quick);

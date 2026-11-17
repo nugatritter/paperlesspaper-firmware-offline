@@ -1,4 +1,5 @@
 #include "epaper_display.h"
+#include "epaper_partial_13.h"
 #include <Arduino.h>
 #include <SerialFlash.h>
 #include <WiFi.h>
@@ -412,7 +413,7 @@ int setImageFromFS_7inch(String fileName, bool errorOverlay) {
    return 0;
 }
 
-int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
+int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bool restoreErrorOverlay) {
    epaperIsUpdating = true;
    saveFile = SerialFlash.open(fileName.c_str());
    if (!saveFile) {
@@ -438,7 +439,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
          Serial.printf("[BMP] Detected Windows BMP. Pixel Data starts at offset: %d\n", offsetData);
       }
       else {
-         Serial.println("[BMP] Detected RAW payload (no BM magic). Reading from byte 4.");
+         Serial.println("[BMP] Detected RAW payload (no BM magic). Reading from byte 0.");
          offsetData = 0;
       }
    }
@@ -459,45 +460,13 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
       return -1;
    }
 
-   display.enableQuickRefresh(displaySettings.displayQuickRefreshTime, false);
-   display.init(115200);
-   display.clearScreen(0x01); // Clear screen memory
-
    // EPD physical resolution is 1200x1600 (2 controllers of 600x1600 each)
    const int physWidth = EPD_HEIGHT;
    const int physHeight = EPD_WIDTH;
-
-   int numChunks = 16;
-   int linesPerChunk = physHeight / numChunks;
-   int bytesPerHalfLine = physWidth / 4;
-
-   uint8_t *chunkBuffer = (uint8_t *)malloc(linesPerChunk * bytesPerHalfLine);
-   if (!chunkBuffer) {
-      Serial.println("[BMP] Malloc for 16 chunks failed! Trying 32 chunks...");
-      numChunks = 32;
-      linesPerChunk = physHeight / numChunks;
-      chunkBuffer = (uint8_t *)malloc(linesPerChunk * bytesPerHalfLine);
-
-      if (!chunkBuffer) {
-         Serial.println("[BMP] Malloc for 32 chunks failed! Trying 64 chunks...");
-         numChunks = 64;
-         linesPerChunk = physHeight / numChunks;
-         chunkBuffer = (uint8_t *)malloc(linesPerChunk * bytesPerHalfLine);
-
-         if (!chunkBuffer) {
-            Serial.println("[BMP] Malloc for 64 chunks failed! Aborting.");
-            saveFile.close();
-            epaperIsUpdating = false;
-            return -1;
-         }
-      }
-   }
-
-   Serial.println("[EPD] Streaming Partial Image to Display... ");
    const bool rotate180 = (displaySettings.rotationPicture > 0);
    std::unique_ptr<GFXcanvas1> overlayCanvas;
    std::unique_ptr<GFXcanvas1> overlayBackgroundCanvas;
-   if (errorOverlay) {
+   if (errorOverlay || restoreErrorOverlay) {
       overlayCanvas.reset(new GFXcanvas1(IMAGE_ERROR_MASK_WIDTH, IMAGE_ERROR_MASK_HEIGHT));
       overlayBackgroundCanvas.reset(new GFXcanvas1(IMAGE_ERROR_MASK_WIDTH, IMAGE_ERROR_MASK_HEIGHT));
       if (!overlayCanvas || !overlayBackgroundCanvas || overlayCanvas->getBuffer() == nullptr ||
@@ -545,7 +514,44 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
          overlayFont.setCursor(IMAGE_ERROR_OVERLAY_LEFT, 16 + textHeight / 2);
       }
       overlayFont.print(IMAGE_ERROR_TEXT);
+#ifdef EPD_TYPE_13INCH
+      if (!padImageErrorBackground13(*overlayCanvas, *overlayBackgroundCanvas)) {
+         Serial.println("[EPD] Error text padding exceeds the overlay mask.");
+         saveFile.close();
+         epaperIsUpdating = false;
+         return -1;
+      }
+      const bool success = writeImageErrorRegion13(*epd_spi_bus, saveFile, offsetData,
+                                                  *overlayCanvas, *overlayBackgroundCanvas,
+                                                  IMAGE_ERROR_STREAM_LEFT, IMAGE_ERROR_OVERLAY_TOP,
+                                                  rotate180, doRefresh, !restoreErrorOverlay);
+      saveFile.close();
+      epaperIsUpdating = false;
+      return success ? 0 : -1;
+#endif
    }
+
+   display.enableQuickRefresh(displaySettings.displayQuickRefreshTime, false);
+   display.init(115200);
+   display.clearScreen(0x01); // Clear screen memory
+
+   int numChunks = 16;
+   int linesPerChunk = physHeight / numChunks;
+   int bytesPerHalfLine = physWidth / 4;
+   uint8_t *chunkBuffer = nullptr;
+   for (; numChunks <= 64; numChunks *= 2) {
+      linesPerChunk = physHeight / numChunks;
+      chunkBuffer = (uint8_t *)malloc(linesPerChunk * bytesPerHalfLine);
+      if (chunkBuffer)
+         break;
+   }
+   if (!chunkBuffer) {
+      Serial.println("[BMP] Could not allocate image transfer buffer.");
+      saveFile.close();
+      epaperIsUpdating = false;
+      return -1;
+   }
+   Serial.println("[EPD] Streaming full image to display memory...");
 
    for (int half = 0; half < 2; half++) {
       int csPin = (half == 0) ? CS_EPD_PIN : EPD_CS_S;
@@ -652,8 +658,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
 
    Serial.println("[EPD] End Partial Streaming... Refreshing now.");
 
-   // PTLW (Partial Window) für beide Controller wieder deaktivieren,
-   // damit der nachfolgende Refresh (DRF) den gesamten Bildschirm erfasst!
+   // Disable the final chunk's partial window on both controllers before the full refresh.
    SPI.beginTransaction(SPISettings(DISPLAY_SPI_SPEED, MSBFIRST, SPI_MODE0));
    digitalWrite(CS_EPD_PIN, LOW);
    SPI.transfer(0x83);
@@ -675,6 +680,16 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay) {
    saveFile.close();
    epaperIsUpdating = false;
    return 0;
+}
+
+int restoreImageErrorOverlay(String fileName) {
+#ifdef EPD_TYPE_13INCH
+   const int result = setImageFromFS_13inch(fileName, true, false, true);
+   Serial.printf("[EPD] Set Image Done: %d\n", result);
+   return result;
+#else
+   return setImageFromFS(fileName);
+#endif
 }
 
 int setImageFromFS(String fileName, bool doRefresh, bool errorOverlay) {
