@@ -139,13 +139,14 @@ SerialFlashFile imageFixture(int offset) {
          image.data[offset + y * 600 + x / 2] = (sourceColor(x, y) << 4) | sourceColor(x + 1, y);
    return image;
 }
-void checkPixels(const ImageWrite &write, bool rotated, int maskLeft, GFXcanvas1 &text, GFXcanvas1 &background, bool overlay) {
+void checkPixels(const ImageWrite &write, bool rotated, int maskLeft, GFXcanvas1 &text, GFXcanvas1 &background, bool overlay,
+                 int maskTop = 24) {
    for (int y = 0; y < write.height; y++) {
       for (int x = 0; x < write.width; x++) {
          const int panelX = write.x + x, panelY = write.y + y;
          uint8_t expected = driverColor(sourceColor(rotated ? 1199 - panelX : panelX, rotated ? 1599 - panelY : panelY));
-         if (overlay && background.getPixel(panelX - maskLeft, panelY - 24)) expected = 1;
-         if (overlay && text.getPixel(panelX - maskLeft, panelY - 24)) expected = 0;
+         if (overlay && background.getPixel(panelX - maskLeft, panelY - maskTop)) expected = 1;
+         if (overlay && text.getPixel(panelX - maskLeft, panelY - maskTop)) expected = 0;
          const uint8_t packed = write.pixels[y * write.width / 2 + x / 2];
          assert(expected == ((x & 1) ? packed & 15 : packed >> 4));
       }
@@ -221,5 +222,36 @@ int main() {
       }
       cases++;
    }
-   std::printf("PASS: %d partial overlay cases (show/restore, palette, rotation, padding, SPI order, failures).\n", cases);
+   // manualOrientation 1 streams the picture turned by 180 degrees: the overlay must turn with it
+   // and appear at the same corner of the picture, i.e. the opposite corner of the panel.
+   for (bool rotated : {false, true}) for (bool showOverlay : {true, false}) {
+      GFXcanvas1 glyphs(64, 640), backing(64, 640);
+      backing.fillRect(12, 8, 32, 564, 1);
+      glyphs.drawPixel(14, 10, 1);
+      int maskLeft = 1112, maskTop = 24;
+      orientImageErrorMasks13(glyphs, backing, rotated, maskLeft, maskTop);
+      if (rotated) {
+         assert(maskLeft == 24 && maskTop == 936);
+         assert(glyphs.getPixel(49, 629) && !glyphs.getPixel(14, 10));
+         assert(backing.getPixel(20, 68) && backing.getPixel(51, 631));
+         assert(!backing.getPixel(19, 68) && !backing.getPixel(20, 67) && !backing.getPixel(52, 631) && !backing.getPixel(51, 632));
+      }
+      else {
+         assert(maskLeft == 1112 && maskTop == 24 && glyphs.getPixel(14, 10) && backing.getPixel(12, 8));
+      }
+      reset();
+      auto rotatedImage = imageFixture(0);
+      assert(writeImageErrorRegion13(spi, rotatedImage, 0, glyphs, backing, maskLeft, maskTop, rotated, true, showOverlay));
+      const ImageWrite &write = display.writes[0];
+      checkPixels(write, rotated, maskLeft, glyphs, backing, showOverlay, maskTop);
+      // The glyph pixel sits at the picture's own position: panel point mapped through the 180-degree turn.
+      const int glyphX = rotated ? 1199 - (1112 + 14) : 1112 + 14;
+      const int glyphY = rotated ? 1599 - (24 + 10) : 24 + 10;
+      assert(glyphX >= write.x && glyphX < write.x + write.width && glyphY >= write.y && glyphY < write.y + write.height);
+      const uint8_t packed = write.pixels[(glyphY - write.y) * write.width / 2 + (glyphX - write.x) / 2];
+      const uint8_t value = ((glyphX - write.x) & 1) ? packed & 15 : packed >> 4;
+      assert(value == (showOverlay ? 0 : driverColor(sourceColor(rotated ? 1199 - glyphX : glyphX, rotated ? 1599 - glyphY : glyphY))));
+      cases++;
+   }
+   std::printf("PASS: %d partial overlay cases (show/restore, palette, rotation, padding, SPI order, failures, manual orientation).\n", cases);
 }
