@@ -5,9 +5,9 @@
 Dieses Dokument beschreibt den Firmware-Build für das paperlesspaper-Display mit 13,3 Zoll (Spectra 6, EL133UF3) und ESP32-C6.
 
 - Als Arbeitsverzeichnis das Verzeichnis `paperlesspaper-firmware-offline` verwenden.
-- Den Build über `build.ps1` ausführen. Das Skript gibt die Umgebung `epd13` immer ausdrücklich an, prüft Konfiguration und Image und schreibt ein Log.
+- Den Build über Panel Studio bzw. dessen Python-CLI oder unter Windows über `build.ps1` ausführen. Beide Abläufe geben `epd13` ausdrücklich an, prüfen Konfiguration und Image und schreiben ein Log.
 - Bei direktem PlatformIO-Aufruf immer `-e epd13` angeben. Nicht auf `default_envs` verlassen: Der Standard ist `epd7`.
-- Den Exitcode von `build.ps1` auswerten. Nur Exitcode `0` bedeutet ein geprüftes, verwendbares Image.
+- Den Exitcode des verwendeten Ablaufs auswerten. Nur Exitcode `0` bedeutet ein geprüftes, verwendbares Image.
 - Der bekannte serielle Port dieses Rechners ist `COM10`.
 - Ein Build allein programmiert kein Gerät. Hardware nur flashen, wenn der Auftrag dies ausdrücklich verlangt und das Zielgerät eindeutig bestimmt ist.
 - Vor einem Firmware-Wechsel von der Cloud-Firmware die gerätespezifischen Zertifikate sichern.
@@ -26,11 +26,39 @@ Dieses Dokument beschreibt den Firmware-Build für das paperlesspaper-Display mi
 
 Die Firmware wählt Displaytyp und zugehörige Abmessungen über das Build-Flag der Umgebung aus. Ein Build mit `epd7` ist für dieses Display nicht geeignet.
 
+## Panel Studio: direkter Ablauf für Windows, Linux und macOS
+
+Die [Python-GUI](desktop/README.md) bindet PlatformIO und esptool direkt ein.
+`build.ps1` wird dafür nicht gestartet. Unter Windows `desktop/start.cmd` öffnen,
+unter Linux/macOS `bash desktop/start.sh` ausführen. Die Starter installieren die
+benötigten Python-Pakete in `desktop/.venv`; Git muss zusätzlich im `PATH` stehen.
+
+Im Verzeichnis `desktop` lässt sich derselbe Ablauf ohne GUI starten, mit dem
+Python aus dieser virtuellen Umgebung:
+
+```text
+python -m panel_studio.firmware_cli build
+python -m panel_studio.firmware_cli verify
+python -m panel_studio.firmware_cli flash --port COM10 --baud 921600
+```
+
+Unter Linux/macOS den passenden `/dev/…`-Port einsetzen. `build` und `verify`
+öffnen keinen Port. `flash` verwendet das vorhandene Image ohne erneuten Build,
+prüft alle vier Flashdateien und schreibt nur die unten beschriebenen Bereiche.
+Die GUI verknüpft die Bestätigung mit dem SHA-256 des App-Images und schließt
+ihre serielle Konsole vor der Übergabe an esptool. Der CLI-Flashaufruf ist direkt
+wirksam und enthält keinen zusätzlichen Bestätigungsdialog.
+
+Logs: `.pio/logs/panel-studio-*.log`. Exitcodes: `0` Erfolg, `2` Voraussetzungen,
+`3` Build, `4` Imageprüfung, `5` Port, `6` Übertragung, `7` Bootloader,
+`130` Benutzerabbruch. Die folgenden PowerShell-Optionen gelten weiterhin für
+das eigenständige `build.ps1`, nicht für die Python-CLI.
+
 ## Voraussetzungen
 
 ### Erforderlich für den Firmware-Build
 
-- Für `build.ps1`: Windows mit Windows PowerShell 5.1 oder PowerShell 7. Beide Versionen sind getestet. Auf macOS oder Linux PlatformIO direkt aufrufen (siehe [Direkter PlatformIO-Aufruf](#direkter-platformio-aufruf)).
+- Für Panel Studio: Python 3.10 oder neuer, siehe [Desktop-Anleitung](desktop/README.md). Für `build.ps1`: Windows mit Windows PowerShell 5.1 oder PowerShell 7. Beide PowerShell-Versionen sind getestet.
 - Internetzugang und etwa 2 GB freier Speicher beim ersten Build.
 - Auf diesem Rechner ist die VS-Code-Erweiterung `platformio.platformio-ide` bereits installiert. `build.ps1` findet PlatformIO im `PATH` oder unter `%USERPROFILE%\.platformio\penv\Scripts`. Alternativ kann eine separat installierte PlatformIO-Core-CLI (`pio`) genutzt werden.
 - Git im `PATH`. GxEPD2 und SerialFlash werden per Git geladen.

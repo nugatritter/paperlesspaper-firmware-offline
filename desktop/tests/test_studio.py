@@ -155,15 +155,16 @@ class ProtocolTests(unittest.TestCase):
     def test_flashing_arguments_do_not_rebuild_or_erase_all(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
-            (project / "build.ps1").touch()
+            (project / "platformio.ini").touch()
             arguments = build_arguments(project, "flash", "COM10", 921600)
-            self.assertIn("-VerifyOnly", arguments)
-            self.assertIn("-Upload", arguments)
-            self.assertNotIn("-Clean", arguments)
+            self.assertIn("flash", arguments)
+            self.assertNotIn("build", arguments)
             self.assertNotIn("erase-flash", arguments)
-            self.assertNotIn("-Upload", build_arguments(project, "build"))
-            self.assertNotIn("-Upload", build_arguments(project, "verify"))
-            self.assertIn("-NoAutoBootloader", build_arguments(project, "flash", "COM10", manual_bootloader=True))
+            self.assertNotIn("--port", build_arguments(project, "build"))
+            self.assertNotIn("--port", build_arguments(project, "verify"))
+            self.assertIn("--manual-bootloader", build_arguments(project, "flash", "COM10", manual_bootloader=True))
+            for port in ("/dev/ttyUSB0", "/dev/cu.usbserial-123", "/dev/serial/by-id/usb-panel"):
+                self.assertIn(port, build_arguments(project, "flash", port))
             for port in ("", "COM10;exit", "COM0", "$(bad)"):
                 with self.assertRaises(ValueError):
                     build_arguments(project, "flash", port)
@@ -240,24 +241,30 @@ class ConfigTests(unittest.TestCase):
         dashboard.deleteLater()
 
 
-@unittest.skipUnless(os.name == "nt", "PowerShell workflow is Windows-specific")
 class FirmwareProcessTests(unittest.TestCase):
+    def test_progress_accepts_classic_and_current_esptool_output(self):
+        job = FirmwareJob()
+        progress = []
+        job.progress.connect(progress.append)
+        job._emit_line("Writing at 0x00010000... (25 %)")
+        job._emit_line("Writing at 0x00020000 [========       ]  62.5%")
+        self.assertEqual(progress, [25, 62])
+        job.deleteLater()
+
     def test_real_qprocess_handles_unicode_paths_output_and_failure(self):
         for exit_code in (0, 7):
-            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory(prefix="panel studio ") as directory:
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory(prefix="panel studio ü ") as directory:
                 project = Path(directory)
-                (project / "build.ps1").write_text(
-                    "param([switch]$VerifyOnly)\n"
-                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
-                    "if (-not $VerifyOnly) { exit 99 }\n"
-                    "Write-Output '==> Prüfung mit Umlauten'\n"
-                    f"exit {exit_code}\n", encoding="utf-8-sig")
+                script = project / "test worker.py"
+                script.write_text("import sys\nprint('==> Prüfung mit Umlauten')\n"
+                                  f"sys.exit({exit_code})\n", encoding="utf-8")
                 job = FirmwareJob(project=project)
                 output = []
                 completed = []
                 job.output.connect(output.append)
                 job.completed.connect(lambda action, code: completed.append((action, code)))
-                job.start("verify")
+                with patch("panel_studio.firmware.build_arguments", return_value=[str(script)]):
+                    job.start("verify")
                 wait_for(lambda: bool(completed), seconds=10)
                 self.assertEqual(completed, [("verify", exit_code)])
                 self.assertTrue(any("Prüfung" in line for line in output))
@@ -351,9 +358,9 @@ class FakeFirmwareJob(QObject):
         self.active = False
         self.calls = []
 
-    def start(self, action, port, baud, manual_bootloader):
+    def start(self, action, port, baud, manual_bootloader, expected_sha256=""):
         assert not self.serial.is_open, "The GUI must release the port before flashing"
-        self.calls.append((action, port, baud, manual_bootloader))
+        self.calls.append((action, port, baud, manual_bootloader, expected_sha256))
         self.active = True
 
 
@@ -374,6 +381,7 @@ class WindowTests(unittest.TestCase):
                 window.start_firmware("flash")
                 self.assertFalse(connection.is_open)
                 self.assertEqual(job.calls[0][0:2], ("flash", "COM10"))
+                self.assertEqual(job.calls[0][-1], summary["sha256"])
                 self.assertFalse(window.connect_button.isEnabled())
                 job.active = False
                 window.reconnect.setChecked(False)
