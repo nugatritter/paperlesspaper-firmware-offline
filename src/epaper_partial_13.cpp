@@ -90,7 +90,35 @@ bool waitReady(uint32_t timeoutMs, const char *stage) {
    return true;
 }
 
+void rotateMask180(GFXcanvas1 &mask) {
+   const int width = mask.width();
+   const int height = mask.height();
+   for (int y = 0; y < (height + 1) / 2; y++) {
+      for (int x = 0; x < width; x++) {
+         const int otherX = width - 1 - x;
+         const int otherY = height - 1 - y;
+         if (y == otherY && x >= otherX)
+            break;
+         const bool pixel = mask.getPixel(x, y);
+         mask.drawPixel(x, y, mask.getPixel(otherX, otherY) ? 1 : 0);
+         mask.drawPixel(otherX, otherY, pixel ? 1 : 0);
+      }
+   }
+}
+
 } // namespace
+
+void orientImageErrorMasks13(GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask, bool rotate180,
+                             int &maskLeft, int &maskTop) {
+   if (!rotate180)
+      return;
+   // The masks are drawn for the default landscape orientation. When the picture is streamed
+   // turned by 180 degrees, the overlay turns with it and moves to the opposite panel corner.
+   rotateMask180(textMask);
+   rotateMask180(backgroundMask);
+   maskLeft = PANEL_WIDTH - maskLeft - textMask.width();
+   maskTop = PANEL_HEIGHT - maskTop - textMask.height();
+}
 
 bool padImageErrorBackground13(GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask) {
    int left = textMask.width();

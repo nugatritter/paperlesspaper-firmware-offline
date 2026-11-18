@@ -521,10 +521,12 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
          epaperIsUpdating = false;
          return -1;
       }
+      int maskLeft = IMAGE_ERROR_STREAM_LEFT;
+      int maskTop = IMAGE_ERROR_OVERLAY_TOP;
+      orientImageErrorMasks13(*overlayCanvas, *overlayBackgroundCanvas, rotate180, maskLeft, maskTop);
       const bool success = writeImageErrorRegion13(*epd_spi_bus, saveFile, offsetData,
                                                   *overlayCanvas, *overlayBackgroundCanvas,
-                                                  IMAGE_ERROR_STREAM_LEFT, IMAGE_ERROR_OVERLAY_TOP,
-                                                  rotate180, doRefresh, !restoreErrorOverlay);
+                                                  maskLeft, maskTop, rotate180, doRefresh, !restoreErrorOverlay);
       saveFile.close();
       epaperIsUpdating = false;
       return success ? 0 : -1;
