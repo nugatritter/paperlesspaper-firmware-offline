@@ -100,6 +100,7 @@ struct Settings
    bool skipSetupMode;
    bool requireImageDigest;
    uint8_t activeSlot;
+   uint8_t manualOrientation; // 0: default landscape, 1: opposite landscape
 };
 
 struct SystemData

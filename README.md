@@ -1,5 +1,12 @@
 # paperlesspaper Offline Firmware
 
+Local extension: [USB diagnostics and configuration console](USB_CONSOLE.md)
+(`DIAG`, `CONFIG GET`, `CONFIG SET`, 115200 baud).
+
+Desktop application: [eYellowBoard Panel Studio](desktop/README.md) — Python/Qt GUI
+for USB diagnostics, settings, logs, and the existing epd13 build/flash workflow.
+On Windows, launch `desktop/start.cmd`.
+
 Offline-first firmware for the paperlesspaper E-Paper frames (ESP32-C6, Spectra 6, 7.3" and 13.3").
 The frame runs without any cloud: send images from your browser over Bluetooth, or let the frame download them from a server in your own network.
 

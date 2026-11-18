@@ -57,6 +57,7 @@ using DisplayType = GxEPD2_7C<GxEPD2_730c_GDEP073E01, GxEPD2_730c_GDEP073E01::HE
 extern DisplayType display;
 extern U8G2_FOR_ADAFRUIT_GFX u8g2_for_adafruit_gfx;
 extern bool epaperIsUpdating;
+extern DisplaySettings displaySettings;
 
 void setDisplayData(const char *clientId, int vddValue);
 void initEpaperDisplay(SPIClass &spiBus);
