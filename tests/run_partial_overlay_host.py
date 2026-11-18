@@ -1,12 +1,13 @@
 """Compile the production region code against simulated SPI, flash, and display APIs."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
 project = Path(__file__).resolve().parents[1]
-compiler = shutil.which("g++")
+compiler = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++") or shutil.which("c++")
 if not compiler:
-    raise SystemExit("A host g++ compiler is required.")
+    raise SystemExit("A host C++17 compiler (g++ or clang++) is required, or set CXX.")
 
 source = (project / "src/epaper_partial_13.cpp").read_text(encoding="utf-8")
 source = source.replace('#include "epaper_partial_13.h"', "")

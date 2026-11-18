@@ -2,7 +2,8 @@
 
 Deutschsprachige Python-Desktop-GUI für die USB-Konsole der Offline-Firmware.
 Die Oberfläche verwendet Qt/PySide6. Serielle Ein-/Ausgabe läuft in einem eigenen
-Thread; Build und Flashen laufen als asynchroner PowerShell-Prozess.
+Thread; Build und Flashen laufen in einem eigenen Python-Prozess direkt über
+PlatformIO Core und esptool. Dafür wird keine PowerShell benötigt.
 
 ## Start unter Windows
 
@@ -28,15 +29,49 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe run.py
 ```
 
-Die GUI ist für die Ausführung aus diesem Repository vorgesehen. Der
-Firmwarebereich verwendet dessen `build.ps1` und `.pio/build/epd13/firmware.bin`.
-Build und Flashen sind unter Windows verfügbar. Die serielle GUI kann auch
-unter Linux/macOS mit Python und denselben Paketen gestartet werden; diese
-Plattformen wurden hier nicht geprüft.
+Bei einer vorhandenen Installation das Startskript erneut ausführen; es installiert
+die zusätzlich benötigten Python-Pakete `platformio` und `esptool` in derselben Umgebung.
+
+## Start unter Linux und macOS
+
+Aus dem Repository-Verzeichnis:
+
+```bash
+bash desktop/start.sh
+# Ohne Panel testen:
+bash desktop/start.sh --demo
+```
+
+Das Startskript verwendet `python3`, legt `desktop/.venv` an und installiert die
+Abhängigkeiten. Erforderlich sind Python **3.10 oder neuer**, dessen `venv`-Modul,
+eine grafische Desktop-Sitzung und für den Firmware-Build Git im `PATH`.
+Qt benötigt unter Linux die zur Distribution passenden grafischen Systembibliotheken.
+Nur die Installation ausführen: `bash desktop/start.sh --install-only`.
+Eine virtuelle Umgebung beim Wechsel des Betriebssystems neu anlegen.
+
+Typische Ports sind `/dev/ttyUSB0` bzw. `/dev/ttyACM0` unter Linux und
+`/dev/cu.usbserial-…` unter macOS. Unter Linux braucht der Benutzer Schreibrechte
+auf das Gerät, häufig über die Gruppe `dialout` (distributionsabhängig; nach einer
+Gruppenänderung neu anmelden). Die GUI nicht als root starten. Bei fehlendem
+USB-Port die CP210x-Treiber und das Datenkabel prüfen.
+
+Am vorhandenen Mac wurde das Panel als **CP2102N** mit USB-ID **`10C4:EA60`**
+und Port **`/dev/cu.usbserial-10`** erkannt. Laut Geräteausgabe ist Apples integrierter
+DriverKit-Treiber `AppleUSBSLCOM` (`com.apple.DriverKit-AppleUSBSLCOM`) aktiv.
+Auf diesem Mac ist somit kein zusätzlicher Silicon-Labs-Treiber erforderlich.
+In der GUI diesen Port auswählen; er wird anhand der USB-ID als Panelkandidat markiert.
+Die Portnummer kann auf anderen Rechnern abweichen. Diese Geräteerkennung bestätigt
+noch keinen vollständigen Build-/Flash-Test unter macOS.
+
+Die GUI ist für die Ausführung aus diesem Repository vorgesehen. Alle drei
+Betriebssysteme verwenden denselben Python-Ablauf und `.pio/build/epd13/firmware.bin`.
+Unter Windows wurden Prozessanbindung, Imageprüfung und Build geprüft.
+Native Linux-/macOS-Läufe und eine reale Übertragung mit dem neuen Ablauf stehen
+noch aus; simulierte Tests decken auch die dort verwendeten Portnamen ab.
 
 ## Mit einem Panel arbeiten
 
-1. Andere Programme schließen, die den COM-Port geöffnet haben, etwa den
+1. Andere Programme schließen, die den seriellen Port geöffnet haben, etwa den
    seriellen Monitor in VS Code oder einen Browser-Flasher.
 2. USB-Datenkabel anschließen. In Panel Studio den Port wählen, hier üblicherweise
    **COM10**. CP210x-/ESP32-USB-Geräte werden als mögliche Panel-Ports markiert;
@@ -112,18 +147,51 @@ Der Firmwarebereich ist auf das **13,3-Zoll-Panel (`epd13`, ESP32-C6)** und die
 Projekt-Firmware ausgelegt. Er zeigt Pfad, Änderungszeit, Größe, SHA-256 und
 Partitionsbelegung des vorhandenen Images.
 
-| Aktion | Aufruf des vorhandenen Build-Skripts |
+| Aktion | Direkter Ablauf |
 | --- | --- |
-| Firmware bauen | `build.ps1` |
-| Image prüfen | `build.ps1 -VerifyOnly` |
-| Auf Panel flashen | `build.ps1 -VerifyOnly -Upload -Port COM… -UploadBaud … -BootloaderTimeout 120` |
+| Firmware bauen | `python -m platformio run --project-dir … --environment epd13`, anschließend Imageprüfung |
+| Image prüfen | Python-Prüfung aller Flashdateien plus `python -m esptool --chip esp32c6 image-info …` für App und Bootloader |
+| Auf Panel flashen | Imageprüfung, Portprüfung, ROM-Bootloader-Abfrage, anschließend `python -m esptool … write-flash …` |
 
 Das Flashen verwendet das bestehende Image **ohne erneuten Build**. Vor der
 Bestätigung zeigt die GUI das Zielgerät, den Imagepfad und den SHA-256 an.
-Das Build-Skript prüft anschließend Image, Zusatzdateien und Zielport selbst.
-Es schreibt Bootloader, Partitionstabelle, OTA-Daten und App gemäß dem vorhandenen
-Projektablauf. Es löscht nicht den gesamten Flash und beschreibt nicht SPIFFS mit
-den Gerätezertifikaten. Details und Voraussetzungen stehen in [BUILD.md](../BUILD.md).
+Der Python-Ablauf prüft anschließend Konfiguration, ESP32-C6-Header, Imagegrößen,
+Segment-Prüfsummen, angehängte SHA-256-Hashes sowie das feste Partitionslayout und
+dessen MD5-Prüfsumme. Die App muss dem in der GUI bestätigten SHA-256 entsprechen.
+Für die Übertragung werden geprüfte Kopien aller vier Dateien erstellt und vor
+dem Schreiben erneut auf Veränderungen geprüft.
+
+Geschrieben werden ausschließlich Bootloader bei `0x0`, Partitionstabelle bei
+`0x8000`, OTA-Daten bei `0xE000` und App bei `0x10000`. NVS, die zweite App-Partition,
+SPIFFS mit den Gerätezertifikaten und Coredump werden nicht überschrieben.
+Es wird kein vollständiger Flash-Erase durchgeführt. Vor dem Schreiben prüft
+esptool den ESP32-C6; nach dem Schreiben müssen alle vier Hashprüfungen erfolgreich sein.
+Details zur Hardware stehen in [BUILD.md](../BUILD.md).
+
+PlatformIO lädt beim ersten Build die in `platformio.ini` festgelegten Compiler,
+Frameworks und Bibliotheken. Die GUI verwendet die Tools aus `desktop/.venv`;
+eine VS-Code-Installation ist nicht erforderlich. Vorhandene PlatformIO-Pakete
+werden genutzt, auch bei einem über die PlatformIO-Konfiguration bzw.
+`PLATFORMIO_CORE_DIR` angepassten Cache. Die Imageprüfung lädt keine Pakete nach.
+Vollständige Ablaufprotokolle liegen unter `.pio/logs/panel-studio-*.log`.
+Eine Projektsperre verhindert gleichzeitige GUI-/CLI-Läufe; unter Windows
+berücksichtigt sie auch die Sperre des weiterhin verfügbaren `build.ps1`.
+Die verbleibende Lockdatei ist normal und muss nicht gelöscht werden.
+
+Der gleiche Ablauf ist ohne GUI nutzbar. Im Verzeichnis `desktop`, mit dem Python
+aus dessen virtueller Umgebung (Windows: `.venv\Scripts\python.exe`, Unix: `.venv/bin/python`):
+
+```bash
+python -m panel_studio.firmware_cli build
+python -m panel_studio.firmware_cli verify
+python -m panel_studio.firmware_cli flash --port /dev/ttyUSB0 --baud 921600
+```
+
+`build` und `verify` öffnen keinen seriellen Port. `flash` programmiert das gewählte
+Gerät; unter Windows beispielsweise `--port COM10` verwenden.
+Optional: `--manual-bootloader`, `--bootloader-timeout 120`,
+`--expected-sha256 <bestätigter App-Hash>`. Der CLI-Aufruf flasht direkt;
+die Bestätigung des Zielgeräts erfolgt bei GUI-Nutzung im Dialog.
 
 Die GUI schließt vor dem Flashen ihren seriellen Monitor, damit der Flasher
 exklusiv auf den gewählten Port zugreifen kann. Fortschritt, Fehler und die
@@ -179,8 +247,10 @@ Tests ohne angeschlossenes Panel:
 Die Tests prüfen Protokollparser, UTF-8-Grenzen, Konfigurationsvalidierung,
 Passwortbehandlung, Formularzustand, simulierten seriellen Empfang, Timeouts,
 Kabelverlust, WLAN-Wartephase und Freigabe des Ports vor dem Flashen. Die
-PowerShell-Anbindung wird mit echten, temporären Testprozessen geprüft, die
-keine Hardware ansprechen. Die Vorschauen dienen der Layoutkontrolle.
+Python-Prozessanbindung wird mit echten, temporären Testprozessen geprüft, die
+keine Hardware ansprechen. Weitere Tests prüfen Imagebeschädigungen, Partitionslayout,
+unveränderte Flashkopien, Bootloader-Portfreigabe und Fehler ohne erneuten Flashlauf.
+Die Vorschauen dienen der Layoutkontrolle.
 Eine tatsächliche Übertragung auf das Panel und dessen anschließendes Verhalten
 müssen gesondert am Gerät geprüft werden.
 
@@ -191,7 +261,11 @@ müssen gesondert am Gerät geprüft werden.
 | `panel_studio/widgets.py` | Diagnose, Konfigurationsformular und Log |
 | `panel_studio/protocol.py` | Parser und Konfigurationsregeln ohne GUI-Abhängigkeit |
 | `panel_studio/transport.py` | Serieller Thread und Befehlszustände |
-| `panel_studio/firmware.py` | Imageübersicht und PowerShell-Prozess |
+| `panel_studio/firmware.py` | Asynchroner Python-Prozess und GUI-Fortschritt |
+| `panel_studio/firmware_cli.py` | PlatformIO, esptool, Bootloader und Ablaufprotokoll |
+| `panel_studio/firmware_core.py` | Image-, Partitions- und Flashplanprüfung ohne Qt |
 
 Verwendete APIs: [Qt for Python](https://doc.qt.io/qtforpython-6/),
-[pySerial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html).
+[pySerial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html),
+[PlatformIO](https://docs.platformio.org/en/latest/core/userguide/cmd_run.html),
+[esptool](https://docs.espressif.com/projects/esptool/en/latest/esp32c6/esptool/basic-commands.html).

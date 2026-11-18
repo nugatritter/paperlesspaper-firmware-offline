@@ -161,12 +161,14 @@ Den letzten Befehl ausschließlich mit dafür geeigneten wiederaufladbaren Akkus
 
 Parser und Konfigurationsvalidierung lassen sich ohne angeschlossenes Gerät prüfen:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\run_serial_console_host.ps1
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+```text
+pio run -e epd13
+python tests/run_serial_console_host.py
 ```
 
-Der Hosttest benötigt `g++` und die vom epd13-Build installierte ArduinoJson-Bibliothek.
+Unter Windows ersetzt `.\build.ps1` den ersten Befehl. Der Hosttest läuft unter Windows,
+Linux und macOS. Er benötigt einen C++17-Compiler (`g++` oder `clang++`, alternativ über
+`CXX` gesetzt) und die vom epd13-Build installierte ArduinoJson-Bibliothek.
 Am Gerät sind anschließend USB-Einstieg/Timeout, Speichern über Neustarts,
 WLAN-Verbindung, beide manuellen Landschaftslagen mit Overlays und die bestehende
 USB-Bootloader-Umschaltung zu prüfen. Die Overlay-Prüfpunkte in

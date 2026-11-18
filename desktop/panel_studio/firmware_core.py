@@ -114,7 +114,7 @@ def validate_partition_csv(path: Path) -> None:
     try:
         entries = []
         for row in csv.reader(path.read_text(encoding="utf-8-sig").splitlines()):
-            if not row or row[0].lstrip().startswith("#"):
+            if not row or not row[0].strip() or row[0].lstrip().startswith("#"):
                 continue
             row = [value.strip() for value in row]
             name, kind, subtype, address, size = row[:5]

@@ -140,7 +140,8 @@ class MainWindow(QMainWindow):
         self.ports.setEditable(True)
         self.ports.setMinimumWidth(260)
         self.ports.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.ports.setToolTip("Port auswählen oder direkt eingeben, beispielsweise COM10.")
+        self.ports.setToolTip("Port auswählen oder eingeben: COM10, /dev/ttyUSB0 oder /dev/cu.usbserial-…")
+        self.ports.lineEdit().setPlaceholderText("Seriellen Port auswählen")
         self.scan_button = button("Ports suchen", self.scan_ports)
         self.connect_button = button("Verbinden", self.toggle_connection, True)
         self.live = QCheckBox("Live-Diagnose · 15 s")
@@ -302,7 +303,7 @@ class MainWindow(QMainWindow):
         elif current:
             self.ports.setEditText(current)
         elif not ports:
-            self.ports.setEditText("COM10")
+            self.ports.setEditText("COM10" if os.name == "nt" else "")
         if hasattr(self, "flash_button"):
             self.update_controls()
 
@@ -353,13 +354,13 @@ class MainWindow(QMainWindow):
         self.command_button.setEnabled(can_query)
         for item in (self.wifi_button, self.run_button, self.reboot_button):
             item.setEnabled(ready)
-        can_build = os.name == "nt" and not busy_job and not self.demo
+        can_build = not busy_job and not self.demo
         self.build_button.setEnabled(can_build)
         artifact_exists = (PROJECT_ROOT / ".pio/build/epd13/firmware.bin").is_file()
         self.verify_button.setEnabled(can_build and artifact_exists)
         is_wrong_panel = self.dashboard.snapshot.get("display", {}).get("physicalWidth") == 800
         self.flash_button.setEnabled(can_build and artifact_exists and bool(self.selected_port()) and not is_wrong_panel)
-        self.flash_button.setToolTip("Dieses Build-Skript ist ausschließlich für epd13." if is_wrong_panel else "Prüft und überträgt das vorhandene Projekt-Image.")
+        self.flash_button.setToolTip("Dieser Firmwareablauf ist ausschließlich für epd13." if is_wrong_panel else "Prüft und überträgt das vorhandene Projekt-Image mit esptool.")
         for item in (self.upload_speed, self.manual_boot, self.reconnect, self.artifact_button):
             item.setEnabled(not busy_job)
 
@@ -538,7 +539,8 @@ class MainWindow(QMainWindow):
         self.firmware_log.clear()
         self.select_page(2)
         try:
-            self.firmware_job.start(action, port, self.upload_speed.currentData(), self.manual_boot.isChecked())
+            self.firmware_job.start(action, port, self.upload_speed.currentData(), self.manual_boot.isChecked(),
+                                    expected_sha256=self.artifact["sha256"] if action == "flash" else "")
         except ValueError as error:
             self.show_problem(str(error))
         self.update_controls()
