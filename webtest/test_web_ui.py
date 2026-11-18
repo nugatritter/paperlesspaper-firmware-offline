@@ -339,7 +339,8 @@ def test_switches_are_stored_immediately(app_session):
             # Charging is a safety matter: it needs a confirmation.
             await page.locator("#settingChargerMode").click()
             await app.confirm(accept=False)
-            assert not await page.is_checked("#settingChargerMode")
+            # The page resets the switch in its dialog handler; wait for it instead of a fixed delay.
+            await page.wait_for_function("() => !document.getElementById('settingChargerMode').checked", timeout=5000)
             assert device.settings["charger_mode"] is False
 
             await page.locator("#settingChargerMode").click()
