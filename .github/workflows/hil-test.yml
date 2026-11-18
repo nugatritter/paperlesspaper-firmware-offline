@@ -111,11 +111,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install platformio
 
+      # Replaces whatever version string src/types.h holds, including local progress
+      # markers such as "0.1.0f". FW_VERSION comes from the job environment, not from
+      # an inline expression, because a manual run passes it as free text.
       - name: Set version
         run: |
+          set -euo pipefail
+          if [[ ! "$FW_VERSION" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            echo "::error::Invalid firmware version: $FW_VERSION"; exit 1
+          fi
           cp deploy/platformio.ini platformio.ini
-          sed -i -e 's/#define SOFTWARE_VERSION "0.1.0"/#define SOFTWARE_VERSION "${{ env.FW_VERSION }}"/' src/types.h
-          grep -q '"${{ env.FW_VERSION }}"' src/types.h
+          sed -i -E "s/^(#define[[:space:]]+SOFTWARE_VERSION[[:space:]]+)\"[^\"]*\"/\1\"$FW_VERSION\"/" src/types.h
+          grep -Eq "^#define[[:space:]]+SOFTWARE_VERSION[[:space:]]+\"$FW_VERSION\"" src/types.h
 
       - name: Build firmware
         run: |
