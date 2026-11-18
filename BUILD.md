@@ -59,7 +59,9 @@ das eigenständige `build.ps1`, nicht für die Python-CLI.
 Unter Linux und macOS wird `build.ps1` nicht verwendet. Build, Imageprüfung und
 Upload laufen über `panel_studio.firmware_cli` mit denselben Prüfungen und
 Exitcodes wie oben beschrieben. Die CI prüft diesen Ablauf auf `ubuntu-latest`
-sowie auf macOS mit Apple Silicon (`macos-latest`) und Intel (`macos-15-intel`) (siehe [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+und auf macOS mit Intel (`macos-15-intel`) (siehe [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Apple Silicon (`macos-latest`) ist in der CI vorerst ausgesetzt, weil GitHub dafür
+wiederholt keinen Runner zuteilen konnte; dort ist der Ablauf noch nicht geprüft.
 
 ### 1. Systempakete installieren
 
