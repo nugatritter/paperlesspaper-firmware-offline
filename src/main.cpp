@@ -30,6 +30,9 @@
 #include "chunked_decoder.h"
 #include "epaper_display.h"
 #include "types.h"
+#include "serial_line.h"
+#include "serial_config.h"
+#include <esp_heap_caps.h>
 
 #if DEBUG
 #define PRINTS(s)         \
@@ -246,6 +249,27 @@ uint32_t lastDownloadedBytes = 0;
 int serverSleepSeconds = 0;
 uint32_t serverSleepReceivedMs = 0;
 bool secondaryImageSlotAvailable = false;
+static bool serialConsoleReady = false;
+static volatile bool serialConsoleActive = false;
+static unsigned long serialConsoleActivity = 0;
+static JsonDocument serialStorageSnapshot;
+static bool eepromReady = false;
+static bool spiffsReady = false;
+static bool serialFlashReady = false;
+struct UpdateDiagnostics {
+   bool valid;
+   int downloadResult;
+   int renderResult;
+   int httpStatus;
+   uint32_t downloadedBytes;
+   uint32_t downloadMs;
+   uint32_t renderMs;
+};
+RTC_DATA_ATTR UpdateDiagnostics lastUpdateDiagnostics = {};
+static int diagnosticHttpStatus = 0;
+static void handleSerialCommand(const char *line);
+static void serialError(const char *command, const char *message);
+static void captureSerialStorage();
 static uint8_t desiredPresentation = DISPLAY_PICTURE;
 static uint8_t renderedPresentation = DISPLAY_PICTURE;
 static bool renderPending = true;
@@ -1317,11 +1341,21 @@ void rebootIntoRomBootloader() {
 }
 
 void checkSerialBootloaderCommand() {
+   static SerialLine<2048> input;
    while (Serial.available()) {
       const int received = Serial.read();
-      if ((received == 'B' || received == 'b') && systemData.usbConnected) {
+      const auto event = input.feed(static_cast<char>(received));
+      if (event == SerialLine<2048>::Event::Bootloader && systemData.usbConnected) {
          Serial.println("[MAIN] Bootloader command 'B' received via Serial!");
          rebootIntoRomBootloader();
+      }
+      else if (event == SerialLine<2048>::Event::Line) {
+         handleSerialCommand(input.line());
+         input.reset();
+         if (forceExitSetup || fwRebootPending) break;
+      }
+      else if (event == SerialLine<2048>::Event::Invalid) {
+         serialError("INPUT", "Invalid character or line longer than 2048 bytes; discarded");
       }
    }
 }
@@ -1476,7 +1510,7 @@ void writeIntToFlash(int value, int startAddr, bool commit) {
       EEPROM.commit();
 }
 
-void saveSettingsToFlash(int startAddr) {
+bool saveSettingsToFlash(int startAddr) {
    // All fields go to flash in one commit, so a power cut (or a press of the reset
    // button) while saving leaves either the old or the new settings, never a mix.
    const int maxLen = MAX_SETTING_STRING_LEN;
@@ -1495,8 +1529,10 @@ void saveSettingsToFlash(int startAddr) {
    writeIntToFlash(settings.autoRotation, startAddr + 815, false);
    writeIntToFlash(settings.requireImageDigest ? 1 : 0, startAddr + 820, false);
    writeIntToFlash(settings.activeSlot == 1 ? 1 : 0, startAddr + 824, false);
-   EEPROM.commit();
-   Serial.println("[MEM] Settings saved to EEPROM");
+   writeIntToFlash(settings.manualOrientation == 1 ? 1 : 0, startAddr + 828, false);
+   const bool saved = EEPROM.commit();
+   Serial.println(saved ? "[MEM] Settings saved to EEPROM" : "[MEM] Saving settings failed");
+   return saved;
 }
 
 void restoreSettingsToFlash(int startAddr) {
@@ -1520,6 +1556,7 @@ void restoreSettingsToFlash(int startAddr) {
    settings.requireImageDigest = readIntFromFlash(startAddr + 820) == 1;
    const int activeSlot = readIntFromFlash(startAddr + 824);
    settings.activeSlot = (activeSlot == 1) ? 1 : 0;
+   settings.manualOrientation = readIntFromFlash(startAddr + 828) == 1 ? 1 : 0;
    Serial.println("[MEM] Settings restored from EEPROM");
    if (DEBUG_FLAG) {
       Serial.printf("[MEM] Settings - BatteryWarning: %d WifiWarning: %d SleepDisabled: %d ImageMode: %d MotionWakeup: %d ChargerMode: %d\n", settings.showBatteryWarning, settings.showWifiWarning, settings.sleepDisabled, settings.imageMode, settings.motionWakeup, settings.chargerMode);
@@ -1621,6 +1658,10 @@ uint16_t getBleMaxChunkPayload(NimBLEConnInfo &connInfo) {
 class ServerCallbacks : public NimBLEServerCallbacks
 {
    void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
+      if (serialConsoleActive) {
+         pServer->disconnect(connInfo.getConnHandle());
+         return;
+      }
       Serial.printf("\n[BLE]Client address: %s\n", connInfo.getAddress().toString().c_str());
       pServer->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 400);
       uint16_t peerMtu = pServer->getPeerMTU(connInfo.getConnHandle());
@@ -1628,7 +1669,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
          blePeerMtu = peerMtu;
       bleLastActivity = millis();
       isBleClientConnected = true;
-      if (wifiSettings.bleInitOk) {
+      if (wifiSettings.bleInitOk && !serialConsoleActive) {
          Serial.printf("[BLE] restart advertising...\n[");
          NimBLEDevice::startAdvertising();
       }
@@ -1656,7 +1697,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
       bleUploadError = false;
       bleDisplayBusy = false;
       bleProtocolV2 = false;
-      if (wifiSettings.bleInitOk) {
+      if (wifiSettings.bleInitOk && !serialConsoleActive) {
          Serial.printf("\n[BLE] restart advertising...\n[");
          NimBLEDevice::startAdvertising();
       }
@@ -1713,6 +1754,7 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks
    };
 
    void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
+      if (serialConsoleActive) return;
       bleLastActivity = millis();
       std::string uuidStr = pCharacteristic->getUUID().toString();
       NimBLEAttValue attrVal = pCharacteristic->getValue();
@@ -2397,6 +2439,7 @@ int downloadAndSaveFile(String fileName, String url) {
 
    int httpCode = http.GET();
    int srvSleep = http.header("X-OpenPaper-Sleep-Seconds").toInt();
+   diagnosticHttpStatus = httpCode;
    uint32_t srvSleepAtMs = millis();
 
    if (httpCode == HTTP_CODE_NOT_MODIFIED && canSkipIfUnchanged) {
@@ -3324,6 +3367,7 @@ bool resetAll(bool resetWifi) {
       }
    }
    settings.activeSlot = 0;
+   settings.manualOrientation = 0;
    settings.downloadUrl = "";
    settings.lastModified = "";
    settings.settingsLastModified = "";
@@ -3517,6 +3561,8 @@ static void showNotice(uint8_t content, const char *text, const char *text2 = ""
 void runSetupMode() {
    Serial.println("[MAIN] Setup Mode Triggered");
    prepareSpiBusForFlash();
+   serialConsoleReady = true;
+   Serial.println("[USB] Ready: HELP, DIAG, CONFIG GET, CONFIG SET {JSON}, WIFI CONNECT, RUN, REBOOT");
 
    unsigned long setupModeStart = millis();
    unsigned long bleConnectedTime = 0;
@@ -3642,7 +3688,15 @@ void runSetupMode() {
          break;
       }
 
-      if (!isBleClientConnected) {
+      if (serialConsoleActive && (!systemData.usbConnected || millis() - serialConsoleActivity > SETUP_IDLE_TIMEOUT * 1000UL)) {
+         Serial.println("[USB] Session ended: USB disconnected or idle timeout");
+         serialConsoleActive = false;
+         break;
+      }
+      if (serialConsoleActive) {
+         lastDisconnectTime = millis();
+      }
+      else if (!isBleClientConnected) {
          if (millis() - lastDisconnectTime > SETUP_MODE_TIMEOUT * 1000) {
             Serial.printf("[MAIN] No BLE connection for %ds. Switching to fetch/refresh mode.\n", SETUP_MODE_TIMEOUT);
             break;
@@ -3684,6 +3738,8 @@ void runSetupMode() {
 
       delay(100);
    }
+   serialConsoleReady = false;
+   serialConsoleActive = false;
 }
 
 // Connects to the stored WiFi. A failed attempt is not repeated in the same wake-up.
@@ -3943,6 +3999,8 @@ void accUpdateOrient() {
    return;
 }
 
+#include "serial_console.h"
+
 void test() {
    // adcAttachPin(14);  // Any pin that is ADC capable
    ledBlink(0, false);
@@ -3991,6 +4049,7 @@ void setup() {
    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
    pinMode(LED_PIN, OUTPUT);
    digitalWrite(LED_PIN, LOW);
+   Serial.setRxBufferSize(4096);
    Serial.begin(115200);
    Serial.println("[MAIN] test mode check..."); // flashers wait for this line, then send 'B'
    analogReadResolution(12);
@@ -4025,7 +4084,7 @@ void setup() {
       startupCounter(false);
    }
 
-   EepromInit(EEPROM_SIZE);
+   eepromReady = EepromInit(EEPROM_SIZE);
    // pinMode(DISP_POWER, INPUT); // USB TEST PINS TODO: only paper 7
    pinMode(INT_PIN, INPUT);
    pinMode(BUSY_PIN, INPUT);
@@ -4046,7 +4105,7 @@ void setup() {
    // Load credentials & settings from EEPROM
    restoreSettingsToFlash(EEPROM_SETTINGS_ADR);
    displaySetOverlayOption(DEVICE_INFO_STRING, true);
-   displaySetRotation(0);
+   displaySetRotation(settings.autoRotation ? 0 : settings.manualOrientation);
    // myEsp32FOTA removed
    char firmwareVersion[] = SOFTWARE_VERSION;
 
@@ -4060,7 +4119,8 @@ void setup() {
    Serial.printf("[MAIN] App slot: %s\n", runningApp ? runningApp->label : "unknown"); // app0 or app1
    if (DEBUG_FLAG)
       Serial.printf("[MAIN] Current counter value: %u VDD: %d\n", StartCounter, systemData.vddValue);
-   if (!SPIFFS.begin(false)) {
+   spiffsReady = SPIFFS.begin(false);
+   if (!spiffsReady) {
       Serial.println("[MEM] SPIFFS initialisation failed!");
    }
    if (StartCounter >= 2) {
@@ -4075,9 +4135,10 @@ void setup() {
    SerialFlash.begin(CS_FLASH_PIN, DISPLAY_SPI_SPEED); // proceed even if begin() fails
    powerSupplyDisplay(true);
    prepareSpiBusForFlash();
-   SerialFlash.begin(CS_FLASH_PIN, FLASH_SPI_SPEED); // proceed even if begin() fails
+   serialFlashReady = SerialFlash.begin(CS_FLASH_PIN, FLASH_SPI_SPEED); // proceed even if begin() fails
    logStorageDiagnostics();
    initializeTransitionImageSlotB();
+   captureSerialStorage();
    initEpaperDisplay(SPI);
    powerSupplyDisplay(false);
    chargeMode(settings.chargerMode);
@@ -4097,7 +4158,7 @@ void setup() {
    // test(); //-----------------test---------please remove
 #endif
 
-   if (buttonWake && !settings.skipSetupMode && !batteryEmpty) {
+   if ((buttonWake || systemData.usbConnected) && !settings.skipSetupMode && !batteryEmpty) {
       tickerFailsave.detach();
       BleInit(CLIENT_ID, true);
       // updateDisplayAsync("connect_bt");
@@ -4162,6 +4223,7 @@ void loop() {
       }
       else {
          systemData.deviceOrientation = accInit(); // only reported to the server, the picture is not rotated
+         displaySetRotation(settings.manualOrientation);
       }
 
       if (batteryEmpty) {
@@ -4206,6 +4268,9 @@ void loop() {
          gotToDeepSleep(pollSettings ? max(60, regularSleep) : 0, false, false);
       }
 
+      const uint32_t downloadStarted = millis();
+      diagnosticHttpStatus = 0;
+      lastDownloadedBytes = 0;
       if (settings.imageMode == 1) { // URL Mode
          dlSuccess = processHttpDownload();
          fileName = activeImageSlotName();
@@ -4214,6 +4279,8 @@ void loop() {
          Serial.printf("[IMAGE] Using BLE uncompressed image slot %s.\n", fileName.c_str());
       }
 
+      const uint32_t downloadDuration = millis() - downloadStarted;
+      const uint32_t renderStarted = millis();
       waitDisplayComplete(false);
       delay(25);
 
@@ -4238,6 +4305,8 @@ void loop() {
          setSuccess = overlayResult == 0 ? -1 : overlayResult;
       }
 
+      lastUpdateDiagnostics = {true, dlSuccess, setSuccess, diagnosticHttpStatus, lastDownloadedBytes,
+                               downloadDuration, millis() - renderStarted};
       debugFS();
       Serial.println("[MAIN] End of Update");
       if (settings.imageMode == 0) {

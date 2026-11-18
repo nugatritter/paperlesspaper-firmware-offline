@@ -1,0 +1,18 @@
+# Repository files are stored with LF. Only Windows script files are checked out with CRLF.
+* text=auto
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+*.bmp  binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.bin  binary
+*.ttf  binary
+*.otf  binary
+*.pdf  binary
