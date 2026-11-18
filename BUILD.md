@@ -54,6 +54,129 @@ Logs: `.pio/logs/panel-studio-*.log`. Exitcodes: `0` Erfolg, `2` Voraussetzungen
 `130` Benutzerabbruch. Die folgenden PowerShell-Optionen gelten weiterhin für
 das eigenständige `build.ps1`, nicht für die Python-CLI.
 
+## Firmware bauen und flashen unter Linux und macOS
+
+Unter Linux und macOS wird `build.ps1` nicht verwendet. Build, Imageprüfung und
+Upload laufen über `panel_studio.firmware_cli` mit denselben Prüfungen und
+Exitcodes wie oben beschrieben. Die CI prüft diesen Ablauf auf `ubuntu-latest`
+und `macos-latest` (siehe [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+### 1. Systempakete installieren
+
+Benötigt werden Git, Python 3.10 oder neuer mit `venv` und für die Host-Tests ein
+C++17-Compiler. Die ESP32-Toolchain lädt PlatformIO selbst.
+
+| System | Befehl |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt install git python3 python3-venv build-essential` |
+| Fedora | `sudo dnf install git python3 gcc-c++` |
+| Arch Linux | `sudo pacman -S git python base-devel` |
+| macOS | `xcode-select --install` (Git und `clang++`), danach `brew install python@3.12` |
+
+Für die Panel-Studio-GUI braucht Qt unter Linux zusätzlich die grafischen
+Systembibliotheken, unter Debian/Ubuntu etwa
+`sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0`. Für Build und
+Flash per CLI ist das nicht nötig.
+
+Unter macOS ist das mit den Command Line Tools ausgelieferte `/usr/bin/python3`
+oft älter als 3.10. `start.sh` verwendet das erste `python3` im `PATH`; nach
+`brew install` prüfen, dass `python3 --version` mindestens 3.10 meldet.
+
+### 2. Repository holen und Umgebung einrichten
+
+```bash
+git clone --recurse-submodules https://github.com/nugatritter/eYellowBoard.git
+cd eYellowBoard/paperlesspaper-firmware-offline
+bash desktop/start.sh --install-only
+```
+
+`start.sh --install-only` legt `desktop/.venv` an und installiert PlatformIO
+Core, esptool, pyserial und PySide6 aus [`desktop/requirements.txt`](desktop/requirements.txt).
+Eine unter Windows angelegte `.venv` ist unter Linux/macOS nicht verwendbar;
+dann `desktop/.venv` löschen und den Befehl wiederholen.
+
+### 3. Bauen und prüfen
+
+```bash
+cd desktop
+.venv/bin/python -m panel_studio.firmware_cli build
+```
+
+Der erste Build lädt Plattform, Toolchain und Bibliotheken (etwa 2 GB nach
+`~/.platformio`) und dauert einige Minuten. Ergebnis bei Exitcode `0`:
+`.pio/build/epd13/firmware.bin`. Ein vorhandenes Image ohne Neubau prüfen:
+
+```bash
+.venv/bin/python -m panel_studio.firmware_cli verify
+```
+
+Optional die Host-Tests (benötigen den epd13-Build für ArduinoJson):
+
+```bash
+cd ..
+desktop/.venv/bin/python tests/run_serial_console_host.py
+desktop/.venv/bin/python tests/run_partial_overlay_host.py
+```
+
+### 4. Seriellen Port finden
+
+```bash
+desktop/.venv/bin/python -m serial.tools.list_ports -v
+```
+
+Das Panel erscheint mit der CP2102N-Kennung `10C4:EA60`:
+
+| System | Typischer Port |
+| --- | --- |
+| Linux | `/dev/ttyUSB0` (stabiler: `/dev/serial/by-id/usb-Silicon_Labs_CP2102N_…`) |
+| macOS | `/dev/cu.usbserial-…` (nicht `/dev/tty.usbserial-…` verwenden) |
+
+**Linux, Zugriffsrechte:** Der Benutzer muss den Port öffnen dürfen. Unter
+Debian/Ubuntu/Fedora die Gruppe `dialout`, unter Arch `uucp`:
+
+```bash
+sudo usermod -aG dialout "$USER"   # Arch: uucp
+```
+
+Danach ab- und wieder anmelden. Alternativ die
+[PlatformIO-udev-Regeln](https://docs.platformio.org/en/latest/core/installation/udev-rules.html)
+installieren. Den Build oder Upload nicht mit `sudo` starten.
+
+**Linux, Port verschwindet nach dem Einstecken:** Unter Ubuntu kann das Paket
+`brltty` CP210x-Geräte belegen. Abhilfe: `sudo apt remove brltty`.
+
+**macOS, kein Port sichtbar:** Aktuelle macOS-Versionen erkennen die CP2102N
+in der Regel ohne Zusatztreiber. Erscheint kein `/dev/cu.usbserial-…`, zuerst
+ein anderes USB-Datenkabel probieren, dann den
+[Silicon-Labs-VCP-Treiber](https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers)
+installieren und unter **Systemeinstellungen → Datenschutz & Sicherheit** erlauben.
+
+### 5. Flashen
+
+Nur flashen, wenn das Zielgerät eindeutig bestimmt ist (siehe Vorgaben oben).
+Serial Monitor, Web-Oberfläche und Panel Studio vorher schließen.
+
+```bash
+cd desktop
+.venv/bin/python -m panel_studio.firmware_cli flash --port /dev/ttyUSB0 --baud 921600
+```
+
+`flash` baut nicht neu, prüft alle vier Flashdateien, schaltet das Gerät per `B`
+in den ROM-Bootloader und schreibt nur die Bereiche aus der Tabelle in
+„Firmware auf das Gerät übertragen“. Schläft das Gerät, nach dem Hinweis den
+großen Reset-Knopf drücken. Ist das Gerät bereits von Hand im Bootloader
+(Boot-Knopf-Schritte unten), `--manual-bootloader` ergänzen. Nach dem
+erfolgreichen Upload den großen Reset-Knopf drücken.
+
+Serielle Ausgabe danach ansehen (Beenden mit Strg+C):
+
+```bash
+.venv/bin/python -m platformio device monitor -p /dev/ttyUSB0 -b 115200
+```
+
+Alternativ startet `bash desktop/start.sh` Panel Studio mit denselben
+Funktionen als GUI.
+
 ## Voraussetzungen
 
 ### Erforderlich für den Firmware-Build
@@ -119,7 +242,9 @@ Zwei Builds desselben Quellstands sind nicht bitidentisch, weil die Kompilierzei
 
 `set_env.py` wird als PlatformIO-Pre-Script ausgeführt. Eine `.env`-Datei ist optional. Fehlt sie, gibt das Script `Warning: .env file not found.` aus und der Build läuft weiter. Vorhandene `KEY=value`-Einträge werden als C/C++-Definitionen ergänzt. `build.ps1` meldet nur, ob eine `.env` vorhanden ist, und schreibt ihren Inhalt nie ins Log. Keine Geheimnisse in Git einchecken.
 
-## Firmware bauen
+## Firmware bauen unter Windows mit build.ps1
+
+Linux und macOS: siehe [Firmware bauen und flashen unter Linux und macOS](#firmware-bauen-und-flashen-unter-linux-und-macos).
 
 Im Firmware-Projektverzeichnis in PowerShell oder im VS-Code-Terminal ausführen:
 
@@ -206,9 +331,9 @@ PlatformIO zählt nur die Programmabschnitte. Die Belegung der App-Partition bez
 
 ### Direkter PlatformIO-Aufruf
 
-Ohne `build.ps1`, etwa auf macOS oder Linux, entfallen alle Prüfungen und das Log. Die Befehle lauten dann:
+Ein direkter PlatformIO-Aufruf ohne `build.ps1` oder `firmware_cli` baut nur; Konfigurations- und Imageprüfung sowie das Log entfallen. Unter Linux/macOS dafür `firmware_cli` verwenden (siehe oben). Die Befehle lauten (unter Linux/macOS ohne installiertes `pio` jeweils `desktop/.venv/bin/python -m platformio` statt `pio`):
 
-```powershell
+```text
 pio run -e epd13              # bauen
 pio run -e epd13 -t clean     # Build-Ausgabe löschen
 pio run -e epd13 -v           # ausführliche Ausgabe
