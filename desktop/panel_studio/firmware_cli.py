@@ -31,6 +31,41 @@ class Reporter:
         self.file.write(message + "\n")
 
 
+def validate_build_dependencies():
+    """Check filesystem APIs required by the configured ESP32 platform."""
+    import importlib
+
+    required = (
+        ("littlefs", ("LittleFS",), "littlefs-python"),
+        ("fatfs", (
+            "Partition", "RamDisk", "create_extended_partition",
+            "create_esp32_wl_image", "calculate_esp32_wl_overhead",
+            "is_esp32_wl_image", "extract_fat_from_esp32_wl",
+        ), "fatfs-ng"),
+        ("fatfs.partition_extended", ("PartitionExtended",), "fatfs-ng"),
+        ("fatfs.wrapper", ("pyf_mkfs", "PY_FR_OK"), "fatfs-ng"),
+    )
+    for module_name, attributes, package in required:
+        try:
+            module = importlib.import_module(module_name)
+            missing = [name for name in attributes if not hasattr(module, name)]
+            if missing:
+                raise ImportError("Fehlende Funktionen: " + ", ".join(missing))
+        except Exception as error:
+            command = subprocess.list2cmdline([
+                sys.executable, "-m", "pip", "install", "-r",
+                str(Path(__file__).resolve().parents[1] / "requirements.txt"),
+            ])
+            raise WorkflowError(
+                f"Build-Abhängigkeit {package} fehlt oder ist inkompatibel "
+                f"({module_name}): {error}. "
+                f"Abhängigkeiten mit demselben Python installieren: {command}. "
+                "Bei FatFS-Konflikten konkurrierende Pakete fatfs/fatfs-python "
+                "aus dieser Umgebung entfernen und fatfs-ng neu installieren.",
+                2,
+            ) from error
+
+
 def child_options(project: Path) -> dict:
     environment = os.environ.copy()
     environment.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
@@ -221,6 +256,8 @@ def enter_bootloader(project: Path, port: str, manual: bool, timeout: int, repor
 def execute(arguments, project: Path, report):
     report("==> Projektkonfiguration prüfen")
     config = validate_project(project)
+    if arguments.action == "build":
+        validate_build_dependencies()
     for package in ("platformio", "esptool", "pyserial"):
         report(f"{package}: {version(package)}")
     if arguments.action == "build":
@@ -311,3 +348,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
