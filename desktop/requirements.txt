@@ -2,3 +2,5 @@ PySide6-Essentials>=6.8,<7
 pyserial>=3.5,<4
 platformio>=6.1.19,<7
 esptool>=5.1,<6
+littlefs-python
+fatfs-ng
