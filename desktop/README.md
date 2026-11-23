@@ -60,7 +60,12 @@ und Port **`/dev/cu.usbserial-10`** erkannt. Laut Geräteausgabe ist Apples inte
 DriverKit-Treiber `AppleUSBSLCOM` (`com.apple.DriverKit-AppleUSBSLCOM`) aktiv.
 Auf diesem Mac ist somit kein zusätzlicher Silicon-Labs-Treiber erforderlich.
 In der GUI diesen Port auswählen; er wird anhand der USB-ID als Panelkandidat markiert.
-Die Portnummer kann auf anderen Rechnern abweichen. Diese Geräteerkennung bestätigt
+Die Portnummer kann sich auch beim Wechsel vom USB-Hub zum direkten Mac-Anschluss
+ändern. Bei „No such file or directory“ **Ports suchen**, den aktuell gefundenen
+Panel-Port auswählen und **Verbinden** klicken. Beim Start und bei **Ports suchen**
+wählt die GUI einen einzelnen erkannten Panelkandidaten vor, wenn der bisherige Port
+nicht mehr vorhanden ist. Sind mehrere Kandidaten angeschlossen, bleibt die Auswahl
+beim Benutzer. Diese Geräteerkennung bestätigt
 noch keinen vollständigen Build-/Flash-Test unter macOS.
 
 Die GUI ist für die Ausführung aus diesem Repository vorgesehen. Alle drei
@@ -76,26 +81,58 @@ noch aus; simulierte Tests decken auch die dort verwendeten Portnamen ab.
 2. USB-Datenkabel anschließen. In Panel Studio den Port wählen, hier üblicherweise
    **COM10**. CP210x-/ESP32-USB-Geräte werden als mögliche Panel-Ports markiert;
    diese Erkennung ersetzt nicht die Auswahl des richtigen Geräts.
-3. **Verbinden** und bei Bedarf einmal den großen Reset-Knopf drücken.
-4. Die GUI fragt `DIAG` ab und erkennt die Meldung `[USB] Ready` nach dem Start.
-   Voraussetzung für Diagnose und Einstellungen ist die Firmware mit der
-   [USB-Konsole](../USB_CONSOLE.md). Eine ältere Firmware kann bereits über den
-   Firmwarebereich aktualisiert werden, auch wenn die Diagnose noch nicht antwortet.
+3. **Verbinden** startet das passive Mithören. Ab der nächsten Panelmeldung zeigt
+   die Konsole die empfangenen Zeilen. USB kann über mehrere Bildzyklen verbunden bleiben.
+4. Für Messwerte im Überblick **Jetzt abfragen** wählen, für Einstellungen
+   **Neu auslesen**. Ein schlafendes Panel beim nächsten Aufwachen abfragen
+   oder bei Bedarf den großen Reset-Knopf drücken. Diese Befehle benötigen
+   die [USB-Konsole](../USB_CONSOLE.md).
 
-„Live-Diagnose · 15 s“ fragt das bereite Panel regelmäßig ab und hält dadurch die
-Setup-Sitzung offen. Zum Batteriesparen **Bild aktualisieren und schlafen** wählen.
+**Bildzyklen live verfolgen** sendet beim Verbinden, beim Aufwachen und während
+der Wartezeit keine Befehle. Bei USB-Versorgung folgt auf das Timer-Aufwachen
+das reguläre Setup-Fenster von etwa 30 Sekunden. Die Statuszeile folgt den Meldungen zum Aufwachen,
+Bildabruf, Bildaufbau und Schlaf. Bis zur ersten Schlafmeldung zeigt Studio nach
+dem ersten Empfang dessen Uhrzeit. Eine manuelle Diagnose öffnet die USB-Sitzung.
+Mit **Bild aktualisieren und schlafen** lässt sich die Sitzung sofort beenden.
+**Forced refresh image** rendert das lokal gespeicherte Bild vollständig neu, ohne
+den Bildserver oder Remote-Einstellungen abzufragen. Dafür muss ein gültiges Bild
+im Panel gespeichert sein.
 Im Deep Sleep kann die GUI das Gerät nicht per UART aufwecken; dazu Reset drücken.
 Eine bestehende BLE-Verbindung vor der USB-Nutzung trennen.
 
 Es wird immer nur ein Konsolenbefehl gleichzeitig gesendet. Nach `WIFI CONNECT`
 wartet die GUI 12 Sekunden auf den Verbindungsversuch und fragt dann die Diagnose
-ab. `RUN` beendet die automatische Abfrage, bis die Firmware erneut bereit ist.
+ab. `RUN` und `FORCE REFRESH IMAGE` starten den Bildablauf.
+Panel Studio zeigt dabei „Bildaufbau läuft“; erst die Schlafmeldung meldet den Schlafzustand.
+Ein Bootbanner während eines laufenden Bildablaufs wird als Neustart mit fehlender
+Abschlussbestätigung gemeldet. Ein USB-Abbruch allein bedeutet, dass der Abschluss
+unbekannt ist; das Panel kann noch arbeiten.
 Bei einer fehlenden Speicherbestätigung wird `CONFIG SET` nicht automatisch
 wiederholt: zuerst mit **Neu auslesen** prüfen, welche Werte gespeichert wurden.
 
+Unter dem Verbindungsstatus zeigt **Nächster Bildzyklus** eine geschätzte Uhrzeit
+mit Countdown. Grundlage ist die empfangene Meldung `Going to Sleep for … seconds`,
+also die tatsächlich angekündigte Schlafdauer einschließlich Fehler- oder Servervorgaben.
+Das konfigurierte Intervall allein startet keinen Countdown. Die Schätzung betrifft
+das Timer-Aufwachen; WLAN, Download und Wiederholungen können den sichtbaren Refresh
+verzögern, bei unverändertem Bild kann er entfallen. Bewegung und Reset können früher
+aufwecken. Bei USB-Trennung bleibt die Schätzung als unbestätigt sichtbar. Nach Ablauf
+wartet Studio auf eine Startmeldung, statt einen erfolgreichen Start zu behaupten.
+Eine neue Verbindung oder ein beobachteter Neustart verwirft die alte Schätzung.
+Ohne Timer oder bei Soft Sleep wird kein automatischer Start angekündigt. Die Anzeige
+aktualisiert sich lokal ohne zusätzliche USB-Abfragen oder Konsolenmeldungen.
+
 ## Überblick
 
-- Geräte-, Spannungs-, WLAN- und Heap-Anzeigen mit Zeit der letzten Abfrage.
+- Die Kachel **Versorgung** zeigt beim Mithören die zuletzt gemeldete Spannung mit
+  Empfangszeit, den Ladezustand und bis zu drei Spannungsmessungen beim Aufwachen.
+  Während des Bildaufbaus aktualisieren Messungen unter Last den aktuellen Wert.
+  Der Aufwachverlauf bleibt separat. Im Schlaf bleiben die letzten Werte sichtbar.
+  Eine neue Verbindung beginnt einen neuen Verlauf. Eine manuelle Diagnose ergänzt
+  den USB-Status. Die Firmware meldet keine verbleibende Akkukapazität in Prozent.
+- Geräte-, WLAN- und Heap-Anzeigen stammen aus der letzten Diagnose.
+- Lesbarer Resetgrund und dauerhafter Renderstatus direkt im Überblick. `POWERON`
+  wird als mehrdeutig erklärt; ein unterbrochener Refresh bleibt nach Neustart sichtbar.
 - Vollständige Diagnose als durchsuchbarer Baum und als formatiertes JSON.
 - JSON-Export einschließlich Firmware-, Netzwerk-, Speicher- und Displaydaten.
 - Anzeige des letzten im RTC-RAM erhaltenen Bildzyklus, wenn verfügbar.
@@ -127,7 +164,7 @@ Die Firmware gibt gespeicherte Passwörter nicht zurück. Beim Aktivieren des
 Lademodus muss im Speicherdialog bestätigt werden, dass geeignete wiederaufladbare
 Akkus eingelegt sind. Diese Bestätigung kann nicht aus einer Datei importiert werden.
 
-Live-Diagnosen überschreiben keine ungespeicherten Formularänderungen. Während
+Diagnoseabfragen überschreiben keine ungespeicherten Formularänderungen. Während
 `CONFIG SET` auf seine Antwort wartet, ist das Formular vor weiteren Eingaben geschützt.
 **Neu auslesen** erlaubt das ausdrückliche Verwerfen lokaler Änderungen.
 
@@ -138,8 +175,11 @@ und URLs bleiben enthalten; URLs können selbst Zugangstoken enthalten.
 
 Nach dem Speichern kann **WLAN verbinden** die Zugangsdaten prüfen.
 **Bild aktualisieren und schlafen** startet den normalen Bildablauf mit den
-gespeicherten Einstellungen. Eine Remote-Settings-URL kann beim nächsten Abruf
-lokale Einstellungen wieder überschreiben.
+gespeicherten Einstellungen. Bei unverändertem Serverbild wird der bestehende
+Bild-Refresh übersprungen. **Forced refresh image** baut stattdessen das lokal
+gespeicherte Bild neu auf und funktioniert auch ohne Serververbindung. Eine
+Remote-Settings-URL kann beim normalen Bildablauf lokale Einstellungen wieder
+überschreiben.
 
 ## Firmware bauen, prüfen und flashen
 
@@ -221,8 +261,7 @@ Das Log kann nach Kategorie und Suchtext gefiltert und exportiert werden.
 Es hält maximal 5000 Einträge. Gesendete `CONFIG SET`-Nutzdaten werden nicht
 protokolliert. Empfangene Firmware-Logs und Diagnoseantworten werden unverändert
 angezeigt und können SSIDs, URLs oder andere Informationen enthalten.
-Panel Studio speichert als Anwendungseinstellungen nur Port, Live-Abfrage und
-Upload-Baudrate; keine Passwörter.
+Panel Studio speichert den gewählten Port und die Upload-Baudrate als Anwendungseinstellungen.
 
 ## Vorschau und Entwicklung
 

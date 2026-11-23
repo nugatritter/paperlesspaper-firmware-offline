@@ -73,6 +73,21 @@ static void captureSerialStorage() {
    }
 }
 
+static void appendRenderDiagnostics(JsonObject output, const RenderJournal &record) {
+   output["valid"] = validRenderJournal(record);
+   if (!validRenderJournal(record)) return;
+   output["attempt"] = record.attempt;
+   output["stage"] = renderStageName(record.stage);
+   output["needsRecovery"] = renderNeedsRecovery(record);
+   output["slot"] = imageSlotName(record.slot);
+   output["targetPresentation"] = record.target;
+   output["result"] = record.result;
+   output["startedAtUptimeMs"] = record.startedMs;
+   output["elapsedMsAtCheckpoint"] = record.elapsedMs;
+   output["batteryBeforeMv"] = record.batteryBeforeMv;
+   output["sampledMinimumBatteryMv"] = record.batteryMinimumMv;
+}
+
 static void appendSerialDiagnostics(JsonDocument &reply) {
    JsonObject firmware = reply["firmware"].to<JsonObject>();
    firmware["version"] = SOFTWARE_VERSION;
@@ -90,8 +105,9 @@ static void appendSerialDiagnostics(JsonDocument &reply) {
    JsonObject system = reply["system"].to<JsonObject>();
    system["uptimeMs"] = millis();
    system["resetReason"] = static_cast<int>(esp_reset_reason());
+   system["resetReasonName"] = resetReasonName(esp_reset_reason());
    system["wakeupCause"] = static_cast<int>(esp_sleep_get_wakeup_cause());
-   const char *wakeNames[] = {"reset", "button", "motion", "timer"};
+   const char *wakeNames[] = {"reset", "power-on-or-reset-pin", "motion", "timer"};
    system["wakeup"] = wakeNames[static_cast<unsigned>(systemData.wakeupCause) % 4];
    system["chip"] = ESP.getChipModel();
    system["chipRevision"] = ESP.getChipRevision();
@@ -141,6 +157,14 @@ static void appendSerialDiagnostics(JsonDocument &reply) {
    panel["secondarySlotAvailable"] = secondaryImageSlotAvailable;
    panel["imageValidator"] = settings.lastModified;
    panel["settingsValidator"] = settings.settingsLastModified;
+   JsonObject render = reply["render"].to<JsonObject>();
+   render["storageOk"] = renderJournalStorageOk;
+   render["active"] = renderMonitoring;
+   render["needsRecovery"] = renderNeedsRecovery(renderJournal);
+   render["interruptedAtBoot"] = renderNeedsRecovery(renderJournalAtBoot) &&
+                                  renderJournalAtBoot.stage != RenderStage::Failed;
+   appendRenderDiagnostics(render["lastAttempt"].to<JsonObject>(), renderJournal);
+   appendRenderDiagnostics(render["atBoot"].to<JsonObject>(), renderJournalAtBoot);
    reply["storageAtBoot"] = serialStorageSnapshot.as<JsonObjectConst>();
    nvs_stats_t stats = {};
    if (nvs_get_stats(nullptr, &stats) == ESP_OK) {
@@ -227,7 +251,7 @@ static void handleSerialCommand(const char *line) {
    reply["ok"] = true;
    if (command == "HELP") {
       reply["command"] = "HELP";
-      reply["commands"] = "HELP | DIAG | CONFIG GET | CONFIG SET {JSON} | WIFI CONNECT | RUN | REBOOT | B";
+      reply["commands"] = "HELP | DIAG | CONFIG GET | CONFIG SET {JSON} | WIFI CONNECT | RUN | FORCE REFRESH IMAGE | REBOOT | B";
       reply["writableKeys"] = "wifiSsid,wifiPassword,downloadUrl,settingsUrl,httpAuthUser,httpAuthPassword,timeout,imageMode,autoRotation,manualOrientation,motionWakeup,showBatteryWarning,showWifiWarning,requireImageDigest,chargerMode,confirmRechargeable";
       reply["maxLineBytes"] = 2048;
       reply["idleTimeoutSeconds"] = SETUP_IDLE_TIMEOUT;
@@ -256,6 +280,15 @@ static void handleSerialCommand(const char *line) {
       wifiSettings.isDeployWifi = true;
       reply["command"] = "WIFI CONNECT";
       reply["pending"] = true;
+   }
+   else if (command == "FORCE REFRESH IMAGE") {
+      reply["command"] = command;
+      serialReply(reply);
+      Serial.flush();
+      serialConsoleActive = false;
+      forceStoredImageRefresh = true;
+      forceExitSetup = true;
+      return;
    }
    else if (command == "RUN" || command == "REBOOT") {
       reply["command"] = command;

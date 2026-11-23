@@ -28,6 +28,8 @@
 #include <soc/lp_aon_reg.h>
 
 #include "chunked_decoder.h"
+#include "render_journal.h"
+#include "reset_diagnostics.h"
 #include "epaper_display.h"
 #include "types.h"
 #include "serial_line.h"
@@ -237,6 +239,7 @@ bool bleDisplayBusy = false;           // an upload START was refused for that r
 bool batteryEmpty = false;
 bool bleImageApplied = false;
 volatile bool forceExitSetup = false;
+volatile bool forceStoredImageRefresh = false;
 volatile bool isBleClientConnected = false;
 bool buttonWake = false; // true if wakeup via reset button
 volatile bool fwUpdateInProgress = false;
@@ -274,6 +277,14 @@ static uint8_t desiredPresentation = DISPLAY_PICTURE;
 static uint8_t renderedPresentation = DISPLAY_PICTURE;
 static bool renderPending = true;
 static bool presentationStateInitialized = false;
+static RenderJournal renderJournal;
+static RenderJournal renderJournalAtBoot;
+static bool renderJournalStorageOk = true;
+static bool renderMonitoring = false;
+static uint32_t lastRenderHeartbeat = 0;
+static uint32_t lastRenderStatusLog = 0;
+static int lastRenderLoggedVoltage = 0;
+static int lastRenderBusyLevel = -1;
 constexpr uint32_t IMAGE_SLOT_SIZE = (EPD_WIDTH * EPD_HEIGHT / 2) + 4096;
 constexpr char IMAGE_SLOT_A_NAME[] = "tmp.bmp";
 constexpr char IMAGE_SLOT_B_NAME[] = "tmp_b.bmp";
@@ -1257,7 +1268,7 @@ bool powerSupplyDisplay(bool enable) {
    }
    else {
       pinMode(DISP_POWER, INPUT);
-      digitalWrite(DISP_POWER, LOW);
+      gpio_set_level((gpio_num_t)DISP_POWER, 0);
       systemData.displayPowerOn = false;
    }
    if (tempState != systemData.displayPowerOn) {
@@ -1384,8 +1395,18 @@ void ledBlink(int timeout, bool on, int dimValue) {
    if (dimValue < 0)
       dimValue = 0;
    systemData.ledDimValue = (dimValue * 255) / 100;
-   if (DEBUG_FLAG)
+   static bool statusLogged = false;
+   static bool lastOn = false;
+   static int lastTimeout = 0;
+   static int lastDimValue = 0;
+   if (DEBUG_FLAG && (!statusLogged || on != lastOn ||
+                      (on && (timeout != lastTimeout || dimValue != lastDimValue)))) {
       Serial.printf("[LED] Set DIM: %d Set Time: %d On: %d (dimInput:%d)\n", systemData.ledDimValue, timeout, on, dimValue);
+      statusLogged = true;
+      lastOn = on;
+      lastTimeout = timeout;
+      lastDimValue = dimValue;
+   }
 
    if (on) {
       if (timeout <= 0) {
@@ -1408,7 +1429,7 @@ void ledBlink(int timeout, bool on, int dimValue) {
    }
 }
 
-int readVDD(bool singleReading) {
+int readVDD(bool singleReading, bool logReading = true) {
    pinMode(BAT_VOLT_EN_PIN, OUTPUT);
 #ifdef EPD_TYPE_13INCH
    digitalWrite(BAT_VOLT_EN_PIN, HIGH);
@@ -1433,7 +1454,11 @@ int readVDD(bool singleReading) {
    }
    pinMode(BAT_VOLT_EN_PIN, INPUT);
    int vdd = int(round(rawValue * VDD_CORRECTION_FACTOR));
-   Serial.printf("[BAT] ADC Raw: %.1f -> VDD: %d mV\n", rawValue, vdd);
+   static int lastLoggedVoltage = 0;
+   if (logReading && (lastLoggedVoltage == 0 || abs(vdd - lastLoggedVoltage) >= 500)) {
+      Serial.printf("[BAT] ADC Raw: %.1f -> VDD: %d mV\n", rawValue, vdd);
+      lastLoggedVoltage = vdd;
+   }
    return vdd;
 }
 
@@ -2922,6 +2947,15 @@ bool sdInit() {
    return false;
 }
 
+static bool isRetryableImageRequestFailure(int result) {
+   if (result == DL_REQUEST_FAILED || result == DL_INCOMPLETE)
+      return true;
+   if (result != DL_HTTP_STATUS)
+      return false;
+   return diagnosticHttpStatus == 408 || diagnosticHttpStatus == 429 ||
+          (diagnosticHttpStatus >= 500 && diagnosticHttpStatus <= 599);
+}
+
 int loadImageFromWeb(String url, String fileName) {
    if (url.length() < 1)
       return -2;
@@ -2930,8 +2964,10 @@ int loadImageFromWeb(String url, String fileName) {
    // int setImage = 0; // Trigger refresh
    int downloadOk = 0;
    String newUrl = getRedirect(url);
-   const int maxAttempts = 3;
+   const int maxRetries = 3;
+   const int maxAttempts = maxRetries + 1;
    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      Serial.printf("[DL] Image request attempt %d/%d\n", attempt, maxAttempts);
       debugFS();
       downloadOk = downloadAndSaveFile(fileName, newUrl);
       if (downloadOk == DL_OK || downloadOk == DL_NOT_MODIFIED) {
@@ -2940,16 +2976,15 @@ int loadImageFromWeb(String url, String fileName) {
          return downloadOk;
       }
 
-      if ((downloadOk != DL_REQUEST_FAILED && downloadOk != DL_INCOMPLETE) || attempt == maxAttempts)
+      if (!isRetryableImageRequestFailure(downloadOk) || attempt == maxAttempts)
          break;
+      Serial.printf("[DL] Temporary image request failure (%d); retry %d/%d in 30 seconds.\n",
+                    downloadOk, attempt, maxRetries);
       if (WiFi.status() != WL_CONNECTED) {
          WiFi.disconnect(true);
          WiFi.begin(wifiSettings.ssid.c_str(), wifiSettings.pss.c_str());
-         delay(3000);
       }
-      else {
-         delay(1000);
-      }
+      delay(30000);
    }
    Serial.printf("[DL] Download failed (%d)\n", downloadOk);
    return downloadOk;
@@ -3126,15 +3161,11 @@ int calculateSleepDuration(int defaultTimeout, bool forceReset, bool getDataOnly
 
 wakeup_reason_t getWakeupReason() {
    int resetReason0 = rtc_get_reset_reason(0);
-   int resetReason1 = rtc_get_reset_reason(1);
    int wakeupReason = esp_sleep_get_wakeup_cause();
-#if DEBUG
-   Serial.printf("[WAKE] Reset Reason 0: %d\n", resetReason0);
-   Serial.printf("[WAKE] Reset Reason 1: %d\n", resetReason1);
-   Serial.printf("[WAKE] Wake Reason: %d\n", wakeupReason);
-#endif
-   if (wakeupReason == esp_sleep_wakeup_cause_t::ESP_SLEEP_WAKEUP_UNDEFINED && resetReason0 == 1 && resetReason1 == 1) {
-      Serial.printf("[WAKE] Got Button Wakeup or Power Loss Wakeup\n");
+   Serial.printf("[WAKE] Reset: %s (%d), ROM reason: %d, wake cause: %d\n",
+                 resetReasonName(esp_reset_reason()), int(esp_reset_reason()), resetReason0, wakeupReason);
+   if (wakeupReason == esp_sleep_wakeup_cause_t::ESP_SLEEP_WAKEUP_UNDEFINED && resetReason0 == 1) {
+      Serial.println("[WAKE] Power-on or reset-pin event; a button press cannot be distinguished from a supply interruption.");
       return wakeup_reason_t::BUTTON;
    }
    if (wakeupReason == esp_sleep_wakeup_cause_t::ESP_SLEEP_WAKEUP_EXT1) {
@@ -3333,21 +3364,28 @@ bool chargeMode(bool enable) {
       delay(5);
       chargeState = digitalRead(CHG_STAT_PIN);
       if (chargeState == LOW) {
-         Serial.println("[CHARGE] on - Charger ON");
          isCharging = true;
       }
       else {
-         Serial.println("[CHARGE] on - Charger DONE");
          isCharging = false;
       }
    }
    else {
-      digitalWrite(CHG_EN_PIN, LOW);
+      gpio_set_level((gpio_num_t)CHG_EN_PIN, 0); // Preload the latch before enabling the output.
       pinMode(CHG_EN_PIN, OUTPUT);
       digitalWrite(CHG_EN_PIN, LOW);
       gpio_hold_dis((gpio_num_t)CHG_EN_PIN); // renew an older hold
       gpio_hold_en((gpio_num_t)CHG_EN_PIN);  // keeps the level while the chip sleeps
-      Serial.println("[CHARGE] off - Charge OFF");
+   }
+   static bool statusLogged = false;
+   static bool lastEnabled = false;
+   static bool lastCharging = false;
+   if (!statusLogged || enable != lastEnabled || isCharging != lastCharging) {
+      Serial.println(!enable ? "[CHARGE] off - Charge OFF" :
+                     (isCharging ? "[CHARGE] on - Charger ON" : "[CHARGE] on - Charger DONE"));
+      statusLogged = true;
+      lastEnabled = enable;
+      lastCharging = isCharging;
    }
    systemData.charging = isCharging;
    return isCharging;
@@ -3385,6 +3423,8 @@ bool resetAll(bool resetWifi) {
       wifiSettings.wifiRetries = 0;
       EepromClear();
    }
+   renderJournal = renderJournalAtBoot = {};
+   EEPROM.put(RENDER_JOURNAL_ADDRESS, renderJournal);
    saveSettingsToFlash(EEPROM_SETTINGS_ADR);
    return true;
 }
@@ -3494,24 +3534,129 @@ static void setDisplayContent(uint8_t content) {
    }
 }
 
+static void loadRenderJournal() {
+   static_assert(RENDER_JOURNAL_ADDRESS + sizeof(RenderJournal) <= EEPROM_SIZE, "Render record must fit EEPROM");
+   renderJournalStorageOk = eepromReady;
+   if (eepromReady) EEPROM.get(RENDER_JOURNAL_ADDRESS, renderJournal);
+   if (!validRenderJournal(renderJournal)) renderJournal = {};
+   renderJournalAtBoot = renderJournal;
+   if (renderNeedsRecovery(renderJournal)) {
+      Serial.printf("[IMAGE] Incomplete render at boot: attempt=%lu stage=%s slot=%u result=%d; full redraw required.\n",
+                    (unsigned long)renderJournal.attempt, renderStageName(renderJournal.stage),
+                    renderJournal.slot, renderJournal.result);
+   }
+}
+
+static bool saveRenderJournal() {
+   if (!eepromReady) {
+      renderJournalStorageOk = false;
+      Serial.println("[IMAGE] Render state storage is unavailable.");
+      return false;
+   }
+   EEPROM.put(RENDER_JOURNAL_ADDRESS, renderJournal);
+   renderJournalStorageOk = EEPROM.commit();
+   if (!renderJournalStorageOk) Serial.println("[IMAGE] Could not persist render state.");
+   return renderJournalStorageOk;
+}
+
+void noteRenderStage(RenderStage stage) {
+   if (!renderMonitoring || renderJournal.stage == stage) return;
+   renderJournal.stage = stage;
+   renderJournal.elapsedMs = millis() - renderJournal.startedMs;
+   saveRenderJournal();
+   Serial.printf("[EPD] Render stage: %s, elapsed=%lu ms, BUSY=%d\n", renderStageName(stage),
+                 (unsigned long)renderJournal.elapsedMs, digitalRead(BUSY_PIN));
+}
+
+void renderHeartbeat(const void *) {
+   if (renderMonitoring && millis() - lastRenderHeartbeat >= 1000) {
+      lastRenderHeartbeat = millis();
+      const int batteryMv = readVDD(true, false);
+      systemData.vddValue = batteryMv;
+      renderJournal.batteryMinimumMv = min(renderJournal.batteryMinimumMv, uint16_t(batteryMv));
+   }
+   const int busyLevel = digitalRead(BUSY_PIN);
+   if (renderMonitoring && (busyLevel != lastRenderBusyLevel ||
+                            abs(systemData.vddValue - lastRenderLoggedVoltage) >= 500 ||
+                            millis() - lastRenderStatusLog >= 10000)) {
+      Serial.printf("[EPD] Render waiting: stage=%s elapsed=%lu ms BUSY=%d battery=%d mV sampledMin=%u mV\n",
+                    renderStageName(renderJournal.stage), (unsigned long)(millis() - renderJournal.startedMs),
+                    busyLevel, systemData.vddValue, renderJournal.batteryMinimumMv);
+      lastRenderStatusLog = millis();
+      lastRenderLoggedVoltage = systemData.vddValue;
+      lastRenderBusyLevel = busyLevel;
+   }
+   delay(1); // The driver callback replaces its normal delay; keep yielding to the scheduler.
+}
+
+static bool beginImageRender(uint8_t target) {
+   // Allow a complete refresh even after a long download/retry sequence.
+   tickerFailsave.once_ms(FAILSAVE_TIMER * 1000, timeoutFailsafe, 0);
+   ledBlink(0, false);
+   if (settings.chargerMode) {
+      Serial.println("[POWER] Pausing charging for the display update.");
+      chargeMode(false);
+   }
+   systemData.vddValue = readVDD(true);
+   const uint32_t attempt = renderJournal.attempt + 1;
+   renderJournal = {};
+   renderJournal.magic = RENDER_JOURNAL_MAGIC;
+   renderJournal.attempt = attempt;
+   renderJournal.startedMs = millis();
+   renderJournal.batteryBeforeMv = renderJournal.batteryMinimumMv = systemData.vddValue;
+   renderJournal.target = target;
+   renderJournal.slot = settings.activeSlot;
+   renderJournal.stage = RenderStage::Preparing;
+   renderJournal.result = -1;
+   if (!saveRenderJournal()) {
+      if (settings.chargerMode) chargeMode(true);
+      return false;
+   }
+   renderMonitoring = true;
+   lastRenderHeartbeat = lastRenderStatusLog = millis();
+   lastRenderLoggedVoltage = systemData.vddValue;
+   lastRenderBusyLevel = -1;
+   display.epd2.setBusyCallback(renderHeartbeat, nullptr);
+   Serial.printf("[IMAGE] Render begin: attempt=%lu target=%u slot=%u battery=%u mV\n",
+                 (unsigned long)attempt, target, renderJournal.slot, renderJournal.batteryBeforeMv);
+   return true;
+}
+
+static int finishImageRender(int result) {
+   if (result == 0 && !waitDisplayComplete(false)) result = -1;
+   renderMonitoring = false;
+   display.epd2.setBusyCallback(nullptr, nullptr);
+   renderJournal.elapsedMs = millis() - renderJournal.startedMs;
+   renderJournal.result = result;
+   renderJournal.stage = result == 0 ? RenderStage::Complete : RenderStage::Failed;
+   // Commit the completed presentation together with the journal, after BUSY is released.
+   if (result == 0) EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, renderJournal.target);
+   if (!saveRenderJournal()) result = -1;
+   Serial.printf("[IMAGE] Render %s: result=%d elapsed=%lu ms sampledMin=%u mV\n",
+                 result == 0 ? "complete" : "failed", result, (unsigned long)renderJournal.elapsedMs,
+                 renderJournal.batteryMinimumMv);
+   if (settings.chargerMode) chargeMode(true);
+   return result;
+}
+
 int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
    bool restoreErrorRegion = false;
 #ifdef EPD_TYPE_13INCH
-   restoreErrorRegion = sourceUnchanged && renderedPresentation == DISPLAY_ERROR_OVERLAY;
+   restoreErrorRegion = sourceUnchanged && renderedPresentation == DISPLAY_ERROR_OVERLAY &&
+                        !renderNeedsRecovery(renderJournal);
 #else
    (void)sourceUnchanged;
 #endif
    desiredPresentation = DISPLAY_PICTURE;
    renderPending = true;
+   if (!beginImageRender(DISPLAY_PICTURE)) return -1;
    if (restoreErrorRegion)
       Serial.println("[IMAGE] Source unchanged; restoring only the error overlay region.");
    else
       logImageSlotCrc(fileName.c_str());
-   const int result = restoreErrorRegion ? restoreImageErrorOverlay(fileName) : setImageFromFS(fileName);
+   int result = restoreErrorRegion ? restoreImageErrorOverlay(fileName) : setImageFromFS(fileName);
+   result = finishImageRender(result);
    if (result == 0) {
-      if (!waitDisplayComplete(false))
-         return -1;
-      setDisplayContent(DISPLAY_PICTURE);
       renderedPresentation = DISPLAY_PICTURE;
       renderPending = false;
    }
@@ -3519,16 +3664,20 @@ int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
 }
 
 static int showImageError(const String &fileName, bool hasPicture) {
+   if (hasPicture && renderNeedsRecovery(renderJournal)) {
+      Serial.println("[IMAGE] Recovering the full stored image before applying an error overlay.");
+      if (showStoredImage(fileName) != 0) return -1;
+   }
    const uint8_t targetPresentation = hasPicture ? DISPLAY_ERROR_OVERLAY : DISPLAY_ERROR_TEXT;
    desiredPresentation = targetPresentation;
    if (!settings.forceDownload && !renderPending && renderedPresentation == targetPresentation)
       return 0;
 
    renderPending = true;
+   if (!beginImageRender(targetPresentation)) return -1;
    if (hasPicture) {
-      const int result = setImageFromFS(fileName, true, true);
-      if (result == 0 && waitDisplayComplete(false)) {
-         setDisplayContent(DISPLAY_ERROR_OVERLAY);
+      const int result = finishImageRender(setImageFromFS(fileName, true, true));
+      if (result == 0) {
          renderedPresentation = DISPLAY_ERROR_OVERLAY;
          renderPending = false;
       }
@@ -3536,23 +3685,23 @@ static int showImageError(const String &fileName, bool hasPicture) {
    }
 
    displaySetText("Error: Picture download failed, please try again", false, true);
-   if (!waitDisplayComplete(false))
+   if (finishImageRender(0) != 0)
       return -1;
-   setDisplayContent(DISPLAY_ERROR_TEXT);
    renderedPresentation = DISPLAY_ERROR_TEXT;
    renderPending = false;
    return 0;
 }
 
 static void showNotice(uint8_t content, const char *text, const char *text2 = "") {
-   if (displayContent() == content && !settings.forceDownload) {
+   if (displayContent() == content && !settings.forceDownload && !renderNeedsRecovery(renderJournal)) {
       Serial.println("[EPD] Notice is already on the display, not drawn again.");
       return;
    }
+   renderPending = true;
+   if (!beginImageRender(content)) return;
    displaySetText(text, false, true, text2);
-   if (!waitDisplayComplete(false))
+   if (finishImageRender(0) != 0)
       return;
-   setDisplayContent(content);
    desiredPresentation = content;
    renderedPresentation = content;
    renderPending = false;
@@ -3562,7 +3711,7 @@ void runSetupMode() {
    Serial.println("[MAIN] Setup Mode Triggered");
    prepareSpiBusForFlash();
    serialConsoleReady = true;
-   Serial.println("[USB] Ready: HELP, DIAG, CONFIG GET, CONFIG SET {JSON}, WIFI CONNECT, RUN, REBOOT");
+   Serial.println("[USB] Ready: HELP, DIAG, CONFIG GET, CONFIG SET {JSON}, WIFI CONNECT, RUN, FORCE REFRESH IMAGE, REBOOT");
 
    unsigned long setupModeStart = millis();
    unsigned long bleConnectedTime = 0;
@@ -4104,6 +4253,7 @@ void setup() {
 
    // Load credentials & settings from EEPROM
    restoreSettingsToFlash(EEPROM_SETTINGS_ADR);
+   loadRenderJournal();
    displaySetOverlayOption(DEVICE_INFO_STRING, true);
    displaySetRotation(settings.autoRotation ? 0 : settings.manualOrientation);
    // myEsp32FOTA removed
@@ -4209,7 +4359,7 @@ void loop() {
       const uint8_t storedPresentation = displayContent();
       renderedPresentation = storedPresentation <= DISPLAY_ERROR_OVERLAY ? storedPresentation : DISPLAY_PICTURE;
       desiredPresentation = renderedPresentation;
-      renderPending = renderedPresentation == DISPLAY_ERROR_TEXT;
+      renderPending = renderedPresentation == DISPLAY_ERROR_TEXT || renderNeedsRecovery(renderJournal);
       presentationStateInitialized = true;
    }
 
@@ -4243,20 +4393,29 @@ void loop() {
       int dlSuccess = 0;
 
       // Fallback: If in BLE mode but the file is missing and we have a download URL configured, switch to URL mode
-      if (settings.imageMode == 0 && !hasValidFlashImage(fileName.c_str()) && settings.downloadUrl.length() > 0) {
+      const bool forcedImageRefresh = forceStoredImageRefresh;
+      forceStoredImageRefresh = false;
+
+      if (!forcedImageRefresh && settings.imageMode == 0 && !hasValidFlashImage(fileName.c_str()) && settings.downloadUrl.length() > 0) {
          Serial.printf("[IMAGE] BLE mode active but image slot %s is invalid. Fallback to URL mode.\n", fileName.c_str());
          settings.imageMode = 1;
          saveSettingsToFlash(EEPROM_SETTINGS_ADR);
       }
 
-      if (settings.settingsUrl.length() > 0 && ensureWifi()) {
+      if (!forcedImageRefresh && settings.settingsUrl.length() > 0 && ensureWifi()) {
          fetchRemoteSettings(); // This might change imageMode or downloadUrl!
       }
       fileName = activeImageSlotName();
 
       const bool canDownload = wifiSettings.ssid.length() > 0 && settings.downloadUrl.length() > 0;
       const bool hasPicture = hasValidFlashImage(fileName.c_str());
-      if ((settings.imageMode == 1 && !canDownload) || (settings.imageMode == 0 && !hasPicture)) {
+      if (forcedImageRefresh && !hasPicture) {
+         Serial.println("[IMAGE] Forced refresh unavailable: no valid stored image.");
+         const int regularSleep = (settings.timeout > 0) ? systemData.sleepPrediction : DEFAULT_SLEEP;
+         gotToDeepSleep(regularSleep, false, false);
+         return;
+      }
+      if (!forcedImageRefresh && ((settings.imageMode == 1 && !canDownload) || (settings.imageMode == 0 && !hasPicture))) {
          Serial.println("[MAIN] Not set up: nothing to download and no picture sent over Bluetooth.");
          if (!hasPicture) { // a stored picture stays on the display
             showNotice(DISPLAY_SETUP_HINT, "Not set up: press button, connect via Bluetooth",
@@ -4271,7 +4430,11 @@ void loop() {
       const uint32_t downloadStarted = millis();
       diagnosticHttpStatus = 0;
       lastDownloadedBytes = 0;
-      if (settings.imageMode == 1) { // URL Mode
+      if (forcedImageRefresh) {
+         Serial.println("[IMAGE] Forced refresh requested; rendering the stored image without contacting the server.");
+         dlSuccess = DL_OK;
+      }
+      else if (settings.imageMode == 1) { // URL Mode
          dlSuccess = processHttpDownload();
          fileName = activeImageSlotName();
       }
@@ -4286,7 +4449,7 @@ void loop() {
 
       int setSuccess = 0;
       if (dlSuccess == 0 || dlSuccess == 1) { // 0 = downloaded/ok, 1 = not modified
-         if (settings.imageMode == 0 && bleImageApplied) {
+         if (!forcedImageRefresh && settings.imageMode == 0 && bleImageApplied) {
             Serial.println("[IMAGE] Image was already applied during setup mode, skipping refresh.");
             setSuccess = 0;
          }

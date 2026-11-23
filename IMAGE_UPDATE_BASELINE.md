@@ -6,6 +6,15 @@ This file records verified context for continuing the work in `../ATOMAR_IMAGE.m
 
 See [`../panel-test/SERVER_OPERATIONS.md`](../panel-test/SERVER_OPERATIONS.md) for the production directory layout, systemd unit, Nginx route, publication commands, and confirmed HTTP checks.
 
+## Refresh recovery and diagnostics, 2026-11-23
+
+- The user confirmed that the reset at 10:16:23 occurred without touching the button or USB connection. The ROM reported POWERON during a forced local refresh. This does not establish the electrical cause; a stable battery-box multimeter reading does not measure the ESP32 rail or reset pin.
+- Each render now persists its start, progress checkpoints and completion in a 28-byte EEPROM record at address 1340. An unfinished render forces a full stored-image redraw on the next image cycle, including unchanged HTTP responses. Normal completed-overlay recovery retains the working partial-window sequence.
+- Charging pauses and the status LED turns off during rendering. The render receives a fresh failsafe budget. These changes and the GPIO latch initialization require a device check; they do not prove that the spontaneous reset is eliminated.
+- Panel Studio distinguishes an active image cycle from sleep, explains reset reasons and shows the persistent render status. Forced refresh continues to use the local image without contacting the server.
+- Logs suppress repeated charge/LED states, battery drift below 500 mV and unchanged automatic DIAG replies. Render sampling continues once per second; waiting messages report changes or ten seconds without a message. Errors and manual diagnostics remain visible. See `USB_CONSOLE.md` and `desktop/README.md` for thresholds and interpretation.
+- Host checks pass: 37 Panel Studio tests, 28 partial-overlay cases, and persistent recovery plus quiet-telemetry cases for epd13 and epd7. No device upload or hardware verification was performed for this revision. Preserve the user's `0.1.0g` version marker.
+
 ## Firmware baseline reviewed on 2026-11-17
 
 - Firmware checkout: `9bc585dd468f418c0253801af26ec03ed2993ec7`.

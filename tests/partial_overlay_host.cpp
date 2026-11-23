@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "render_journal.h"
 
 using std::min;
 using std::max;
@@ -35,6 +36,8 @@ void digitalWrite(int pin, int value) { chipLevel[pin] = value; }
 int digitalRead(int) { return ((hangRefresh && refreshStarted) || elapsedMs < busyUntil) ? LOW : HIGH; }
 void delay(uint32_t ms) { elapsedMs += ms; }
 uint32_t millis() { return elapsedMs; }
+void noteRenderStage(RenderStage) {}
+void renderHeartbeat(const void *) { delay(1); }
 struct SerialMock {
    std::string messages;
    void println(const char *message) { messages += std::string(message) + "\n"; }

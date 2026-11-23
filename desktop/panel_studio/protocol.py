@@ -29,6 +29,43 @@ LABELS = {
     "chargerMode": "Akkus laden", "confirmRechargeable": "Akkus bestätigt",
 }
 
+RESET_REASONS = {
+    0: "UNKNOWN", 1: "POWERON", 2: "EXTERNAL_PIN", 3: "SOFTWARE", 4: "PANIC",
+    5: "INTERRUPT_WATCHDOG", 6: "TASK_WATCHDOG", 7: "WATCHDOG", 8: "DEEP_SLEEP",
+    9: "BROWNOUT", 10: "SDIO", 11: "USB", 12: "JTAG", 13: "EFUSE",
+    14: "POWER_GLITCH", 15: "CPU_LOCKUP",
+}
+
+
+def reset_description(system: dict) -> str:
+    reason = system.get("resetReasonName") or RESET_REASONS.get(system.get("resetReason"), "UNKNOWN")
+    descriptions = {
+        "POWERON": "Einschalten oder Reset-Pin; Tastendruck und Versorgungsunterbrechung sind nicht unterscheidbar",
+        "BROWNOUT": "Unterspannung am ESP32 erkannt",
+        "POWER_GLITCH": "Störung der Versorgung erkannt",
+        "SOFTWARE": "Software-Neustart", "DEEP_SLEEP": "Aufwachen aus Deep Sleep",
+        "PANIC": "Firmware-Absturz", "TASK_WATCHDOG": "Task-Watchdog",
+        "INTERRUPT_WATCHDOG": "Interrupt-Watchdog", "WATCHDOG": "Watchdog",
+    }
+    return f"{reason}: {descriptions.get(reason, 'Reset-Grund nicht näher eingegrenzt')}"
+
+
+def render_description(snapshot: dict) -> str:
+    render = snapshot.get("render", {})
+    if render.get("storageOk") is False:
+        return "Renderstatus konnte nicht zuverlässig gespeichert werden. Abschluss unbestätigt."
+    attempt = render.get("lastAttempt", {})
+    if not attempt.get("valid"):
+        return "Kein dauerhafter Renderstatus vorhanden. Ein vollständiges Bild ist damit nicht bestätigt."
+    stage = attempt.get("stage", "unknown")
+    if stage == "complete" and not render.get("needsRecovery"):
+        return f"Bildaufbau von der Firmware abgeschlossen · {attempt.get('elapsedMsAtCheckpoint', '—')} ms. Sichtbare Pixel werden nicht geprüft."
+    phases = {"preparing": "Vorbereitung", "streaming": "Bildübertragung", "refreshing": "Panel-Refresh", "failed": "Fehler"}
+    phase = phases.get(stage, stage)
+    if render.get("interruptedAtBoot"):
+        return f"Beim Neustart war der Bildaufbau unvollständig. Letzte gespeicherte Phase: {phase}. Vollständiger Neuaufbau erforderlich."
+    return f"Bildaufbau nicht abgeschlossen · Phase: {phase}."
+
 
 def parse_reply(line: str) -> dict[str, Any] | None:
     if not line.startswith("[USB] {"):

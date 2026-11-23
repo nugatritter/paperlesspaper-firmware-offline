@@ -1,5 +1,6 @@
 #include "epaper_display.h"
 #include "epaper_partial_13.h"
+#include "render_journal.h"
 #include <Arduino.h>
 #include <SerialFlash.h>
 #include <WiFi.h>
@@ -386,6 +387,7 @@ int setImageFromFS_7inch(String fileName, bool errorOverlay) {
       return -1;
    }
 
+   noteRenderStage(RenderStage::Streaming);
    display.firstPage();
    do {
       display.fillScreen(GxEPD_WHITE);
@@ -554,6 +556,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
       return -1;
    }
    Serial.println("[EPD] Streaming full image to display memory...");
+   noteRenderStage(RenderStage::Streaming);
 
    for (int half = 0; half < 2; half++) {
       int csPin = (half == 0) ? CS_EPD_PIN : EPD_CS_S;
@@ -676,6 +679,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
    SPI.endTransaction();
 
    if (doRefresh) {
+      noteRenderStage(RenderStage::Refreshing);
       display.refresh();
    }
 
@@ -788,10 +792,12 @@ bool waitDisplayComplete(bool quick) {
          break;
       }
 #if DEBUG
-      Serial.println("[EPD] Wait for Display...");
+      if (counter == 1 || quick)
+         Serial.println("[EPD] Waiting for display completion...");
 #endif
       delay(500);
    }
+   Serial.println("[EPD] Display is still BUSY after completion check.");
    return false;
 }
 

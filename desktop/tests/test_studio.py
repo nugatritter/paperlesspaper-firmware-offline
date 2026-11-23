@@ -18,12 +18,69 @@ from PySide6.QtCore import QObject, QSettings, Signal
 
 from panel_studio.app import MainWindow, create_application
 from panel_studio.firmware import APP_CAPACITY, FirmwareJob, build_arguments, image_summary
-from panel_studio.protocol import LineDecoder, export_config, import_config, make_config_command, parse_reply, validate_config
+from panel_studio.protocol import LineDecoder, export_config, import_config, make_config_command, parse_reply, validate_config, reset_description, render_description
 from panel_studio.sample import SAMPLE_DIAGNOSTICS
+from panel_studio.schedule import CycleSchedule
 from panel_studio.transport import ConsoleController, SerialWorker
 from panel_studio.widgets import ConfigEditor, Dashboard
 
 APPLICATION = create_application()
+
+
+class ResetDiagnosticsTests(unittest.TestCase):
+    def test_legacy_reset_codes_are_explained_without_claiming_a_button_press(self):
+        self.assertIn("Unterspannung", reset_description({"resetReason": 9}))
+        self.assertIn("nicht unterscheidbar", reset_description({"resetReason": 1, "wakeup": "button"}))
+
+    def test_persisted_interruption_is_visible_in_dashboard_and_export(self):
+        snapshot = deepcopy(SAMPLE_DIAGNOSTICS)
+        snapshot["render"] = {
+            "storageOk": True, "interruptedAtBoot": True, "needsRecovery": True,
+            "lastAttempt": {"valid": True, "stage": "refreshing"},
+        }
+        dashboard = Dashboard()
+        dashboard.display_snapshot(snapshot)
+        self.assertIn("unvollständig", dashboard.render_label.text())
+        self.assertIn("Panel-Refresh", dashboard.render_label.text())
+        self.assertTrue(dashboard.snapshot["render"]["needsRecovery"])
+        dashboard.clear()
+        self.assertNotIn("unvollständig", dashboard.render_label.text())
+        dashboard.deleteLater()
+
+    def test_power_card_tracks_passive_samples_and_charge_transitions(self):
+        dashboard = Dashboard()
+        card = dashboard.power_card
+        for millivolts in (5460, 5480, 5496, 5498):
+            card.observe_line("RX", "[MAIN] test mode check...")
+            card.observe_line("RX", f"[BAT] ADC Raw: 823.0 -> VDD: {millivolts} mV")
+        self.assertEqual(len(card.history), 3)
+        self.assertNotIn("5,460", card.history_label.text())
+        self.assertIn("5,498 V", card.history_label.text())
+        card.observe_line("RX", "[CHARGE] on - Charger ON")
+        self.assertIn("Akkus werden geladen", card.detail.text())
+        card.observe_line("RX", "[POWER] Pausing charging for the display update.")
+        card.observe_line("RX", "[CHARGE] off - Charge OFF")
+        self.assertIn("pausiert", card.detail.text())
+        card.observe_line("RX", "[EPD] Render waiting: stage=refreshing elapsed=1 ms BUSY=0 battery=5491 mV sampledMin=5480 mV")
+        self.assertEqual(card.value.text(), "5,491 V")
+        self.assertNotIn("5,491", card.history_label.text())
+        card.observe_line("RX", "[CHARGE] on - Charger DONE")
+        card.observe_line("RX", "[MAIN] Going to Sleep for 60 seconds")
+        self.assertIn("kein aktiver Ladevorgang", card.detail.text())
+        self.assertRegex(card.detail.text(), r"empfangen um [0-9:]{8}")
+        card.observe_line("RX", "[CHARGE] off - Charge OFF")
+        self.assertIn("Ladefunktion aus", card.detail.text())
+        dashboard.display_snapshot(SAMPLE_DIAGNOSTICS)
+        self.assertIn("USB verbunden", card.detail.text())
+        self.assertEqual(len(card.history), 3)
+        dashboard.clear()
+        self.assertFalse(card.history_label.text())
+        self.assertEqual(card.value.text(), "—")
+        dashboard.deleteLater()
+
+    def test_unknown_or_failed_persistence_does_not_claim_completion(self):
+        self.assertIn("nicht bestätigt", render_description({}))
+        self.assertIn("unbestätigt", render_description({"render": {"storageOk": False}}))
 
 
 def wait_for(predicate, seconds=2):
@@ -281,6 +338,9 @@ class TransportTests(unittest.TestCase):
         self.controller.log_received.connect(lambda kind, text: self.logs.append((kind, text)))
         self.controller.reply_received.connect(self.replies.append)
         self.controller.connect_port("TEST-PORT")
+        wait_for(lambda: self.controller.state == "waiting")
+        self.assertEqual(self.serial.writes, [])
+        self.assertTrue(self.controller.request("DIAG"))
         wait_for(lambda: self.controller.state == "ready")
 
     def tearDown(self):
@@ -293,6 +353,18 @@ class TransportTests(unittest.TestCase):
         self.serial.respond = False
         self.assertTrue(self.controller.request("CONFIG GET"))
         self.assertFalse(self.controller.request("REBOOT"))
+
+    def test_manual_diagnosis_logs_errors_and_unsolicited_replies(self):
+        self.serial.respond = False
+        self.logs.clear()
+        self.controller.request("DIAG")
+        self.serial.inject('[USB] {"protocol":1,"command":"CONFIG GET","ok":true}')
+        self.serial.inject('[USB] {invalid}')
+        self.serial.inject('[USB] {"protocol":1,"command":"DIAG","ok":false,"error":"Unavailable"}')
+        wait_for(lambda: self.controller.state == "waiting")
+        self.assertEqual(len([kind for kind, _ in self.logs if kind == "JSON"]), 3)
+        self.assertTrue(any("Verspätete" in text for _, text in self.logs))
+        self.assertTrue(any("ungültige" in text for _, text in self.logs))
 
     def test_secret_is_sent_but_never_logged(self):
         self.controller.request(make_config_command({"wifiPassword": "privateBBBB", "timeout": 600}))
@@ -316,11 +388,13 @@ class TransportTests(unittest.TestCase):
         wait_for(lambda: any("Verspätete" in text for _, text in self.logs))
         self.assertEqual(self.controller.pending, "DIAG")
 
-    def test_ready_after_reset_restarts_handshake(self):
+    def test_ready_after_reset_listens_without_sending_a_command(self):
         self.serial.inject("[MAIN] test mode check...")
         self.serial.inject("[USB] Ready: DIAG")
-        wait_for(lambda: len(self.replies) == 2)
+        wait_for(lambda: any("[USB] Ready:" in line for _, line in self.logs))
         self.assertEqual(self.controller.state, "ready")
+        self.assertIsNone(self.controller.pending)
+        self.assertEqual(len(self.replies), 1)
 
     def test_wifi_wait_blocks_other_commands_then_queries(self):
         self.controller.request("WIFI CONNECT")
@@ -332,7 +406,33 @@ class TransportTests(unittest.TestCase):
 
     def test_run_disables_live_ready_state(self):
         self.controller.request("RUN")
+        wait_for(lambda: self.controller.state == "updating")
+        self.assertFalse(self.controller.request("DIAG"))
+
+    def test_reset_during_forced_refresh_reports_missing_completion_then_reconnects(self):
+        problems = []
+        self.controller.problem.connect(problems.append)
+        self.controller.request("FORCE REFRESH IMAGE")
+        wait_for(lambda: self.controller.state == "updating")
+        self.serial.inject("[EPD] Render stage: refreshing, elapsed=4000 ms, BUSY=1")
+        self.serial.inject("ESP-ROM:esp32c6-20220919")
+        self.serial.inject("[MAIN] test mode check...")
+        self.serial.inject("[USB] Ready: DIAG")
+        wait_for(lambda: self.controller.state == "ready")
+        self.assertTrue(any("Neustart während" in message for message in problems))
+        self.assertFalse(self.controller.update_in_progress)
+
+    def test_completed_update_then_boot_does_not_report_interruption(self):
+        problems = []
+        self.controller.problem.connect(problems.append)
+        self.controller.request("FORCE REFRESH IMAGE")
+        wait_for(lambda: self.controller.state == "updating")
+        self.serial.inject("[MAIN] End of Update")
+        self.serial.inject("[MAIN] Going to Sleep for 60 seconds")
         wait_for(lambda: self.controller.state == "sleeping")
+        self.serial.inject("ESP-ROM:esp32c6-20220919")
+        wait_for(lambda: self.controller.state == "waiting")
+        self.assertEqual(problems, [])
 
     def test_bootloader_command_is_explicit(self):
         self.controller.request("B")
@@ -365,6 +465,109 @@ class FakeFirmwareJob(QObject):
 
 
 class WindowTests(unittest.TestCase):
+    def test_cycle_countdown_is_visible_and_does_not_poll_or_log(self):
+        with tempfile.TemporaryDirectory() as directory, patch("panel_studio.app.available_ports", return_value=[("COM10", "COM10  ·  Panel", True)]):
+            connection = FakeSerial()
+            controller = ConsoleController(worker_factory=lambda port: SerialWorker(port, lambda **options: connection))
+            now = [1000.0]
+            controller.cycle_schedule = CycleSchedule(clock=lambda: now[0])
+            preferences = QSettings(str(Path(directory) / "prefs.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(preferences=preferences, controller=controller)
+            logs = []
+            controller.log_received.connect(lambda kind, text: logs.append((kind, text)))
+            try:
+                window.toggle_connection()
+                wait_for(lambda: controller.state == "waiting")
+                connection.inject("[WAKE] Got Timer Wakeup")
+                connection.inject("[USB] Ready: DIAG")
+                wait_for(lambda: controller.state == "ready")
+                self.assertIsNone(controller.pending)
+                connection.inject("[DL] Download Image file: http://panel.example/")
+                wait_for(lambda: "Bildabruf" in window.status_label.text())
+                self.assertIn("Letzter Empfang", window.cycle_label.text())
+                connection.inject("[IMAGE] Render begin: attempt=1")
+                wait_for(lambda: "Bildaufbau" in window.status_label.text())
+                connection.inject("[MAIN] Going to Sleep for 60 seconds (MotionWake: 0)")
+                wait_for(lambda: controller.state == "sleeping")
+                self.assertIn("00:01:00", window.cycle_label.text())
+                self.assertEqual(connection.writes, [])
+                writes_before = list(connection.writes)
+                logs_before = list(logs)
+                now[0] += 30
+                window.cycle_timer.timeout.emit()
+                self.assertIn("00:00:30", window.cycle_label.text())
+                self.assertEqual(connection.writes, writes_before)
+                self.assertEqual(logs, logs_before)
+                connection.fail_read = True
+                wait_for(lambda: controller.worker is None)
+                self.assertIn("USB getrennt", window.cycle_label.text())
+                now[0] += 60
+                window.cycle_timer.timeout.emit()
+                self.assertIn("Start noch nicht bestätigt", window.cycle_label.text())
+                connection.fail_read = False
+                window.toggle_connection()
+                wait_for(lambda: controller.state == "waiting")
+                self.assertIn("noch nicht abschätzbar", window.cycle_label.text())
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_missing_saved_port_is_replaced_after_usb_move(self):
+        old_port = "/dev/cu.usbserial-20110"
+        new_port = "/dev/cu.usbserial-110"
+        ports = [(new_port, f"{new_port}  ·  CP2102N", True)]
+        with tempfile.TemporaryDirectory() as directory, patch("panel_studio.app.available_ports", return_value=ports):
+            preferences = QSettings(str(Path(directory) / "prefs.ini"), QSettings.Format.IniFormat)
+            preferences.setValue("port", old_port)
+            connection = FakeSerial()
+            controller = ConsoleController(worker_factory=lambda port: SerialWorker(port, lambda **options: connection))
+            window = MainWindow(preferences=preferences, controller=controller)
+            try:
+                self.assertEqual(window.selected_port(), new_port)
+                self.assertIn(old_port, window.status_label.text())
+                self.assertIn(new_port, window.status_label.text())
+                self.assertIsNone(controller.worker)
+                window.toggle_connection()
+                wait_for(lambda: controller.state == "waiting")
+                self.assertEqual(connection.port, new_port)
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_rescan_finds_moved_panel_without_reopening_window(self):
+        old_port = "/dev/cu.usbserial-20110"
+        new_port = "/dev/cu.usbserial-110"
+        with tempfile.TemporaryDirectory() as directory, patch("panel_studio.app.available_ports") as scan:
+            scan.return_value = [(old_port, f"{old_port}  ·  CP2102N", True)]
+            preferences = QSettings(str(Path(directory) / "prefs.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(preferences=preferences)
+            try:
+                self.assertEqual(window.selected_port(), old_port)
+                scan.return_value = [(new_port, f"{new_port}  ·  CP2102N", True)]
+                window.scan_ports()
+                self.assertEqual(window.selected_port(), new_port)
+                self.assertIsNone(window.controller.worker)
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_rescan_preserves_existing_port_and_does_not_guess_between_panels(self):
+        for current, ports in (
+            ("COM9", [("COM10", "COM10  ·  Panel", True), ("COM9", "COM9  ·  Serial", False)]),
+            ("COM9", [("COM10", "COM10  ·  Panel", True), ("COM11", "COM11  ·  Panel", True)]),
+            ("COM9", []),
+        ):
+            with self.subTest(ports=ports), tempfile.TemporaryDirectory() as directory, patch("panel_studio.app.available_ports", return_value=ports):
+                preferences = QSettings(str(Path(directory) / "prefs.ini"), QSettings.Format.IniFormat)
+                preferences.setValue("port", current)
+                window = MainWindow(preferences=preferences)
+                try:
+                    self.assertEqual(window.selected_port(), current)
+                    self.assertIsNone(window.controller.worker)
+                finally:
+                    window.close()
+                    window.deleteLater()
+
     def test_flash_releases_port_and_no_automatic_device_write_in_demo(self):
         with tempfile.TemporaryDirectory() as directory, patch("panel_studio.app.available_ports", return_value=[("COM10", "COM10  ·  Test", True)]):
             connection = FakeSerial()
@@ -372,10 +575,9 @@ class WindowTests(unittest.TestCase):
             job = FakeFirmwareJob(connection)
             preferences = QSettings(str(Path(directory) / "prefs.ini"), QSettings.Format.IniFormat)
             window = MainWindow(preferences=preferences, controller=controller, firmware_job=job)
-            window.live.setChecked(False)
             window.confirm = lambda title, text: True
             window.toggle_connection()
-            wait_for(lambda: controller.state == "ready")
+            wait_for(lambda: controller.state == "waiting")
             summary = {"path": "firmware.bin", "sha256": "a" * 64, "size": 100000, "modified": 0, "percent": 5}
             with patch("panel_studio.app.image_summary", return_value=summary):
                 window.start_firmware("flash")

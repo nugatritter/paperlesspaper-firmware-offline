@@ -3,6 +3,7 @@
 #ifdef EPD_TYPE_13INCH
 
 #include "epaper_display.h"
+#include "render_journal.h"
 #include <memory>
 #include <new>
 
@@ -85,7 +86,7 @@ bool waitReady(uint32_t timeoutMs, const char *stage) {
          Serial.printf("[EPD] Partial refresh timeout: %s\n", stage);
          return false;
       }
-      delay(1);
+      renderHeartbeat(nullptr);
    }
    return true;
 }
@@ -209,6 +210,7 @@ bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t ima
    // Finish every flash read before selecting a panel IC on the shared SPI bus.
    display.enableQuickRefresh(0, false);
    display.init(115200);
+   noteRenderStage(RenderStage::Streaming);
    display.writeImage(pixels.get(), region.x, region.y, region.width, region.height);
    display.writeImage(companionPixels, companion.x, companion.y, companion.width, companion.height);
    armRegion(spi, half, region);
@@ -218,6 +220,7 @@ bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t ima
    if (!doRefresh)
       return true;
 
+   noteRenderStage(RenderStage::Refreshing);
    writeCommand(spi, true, true, 0x04);
    if (!waitReady(10000, "power on"))
       return false;

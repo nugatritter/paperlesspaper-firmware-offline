@@ -144,16 +144,18 @@ class MainWindow(QMainWindow):
         self.ports.lineEdit().setPlaceholderText("Seriellen Port auswählen")
         self.scan_button = button("Ports suchen", self.scan_ports)
         self.connect_button = button("Verbinden", self.toggle_connection, True)
-        self.live = QCheckBox("Live-Diagnose · 15 s")
-        self.live.setToolTip("Hält die USB-Sitzung offen, solange die Konsole bereit ist.")
-        self.live.setChecked(self.preferences.value("live", True, type=bool))
         connection.addWidget(self.ports, 1)
         connection.addWidget(self.scan_button)
         connection.addWidget(self.connect_button)
-        connection.addWidget(self.live)
+        connection.addWidget(label("Bildzyklen live verfolgen", "muted"))
         body.addLayout(connection)
-        self.status_label = label("Nicht verbunden · USB anschließen, verbinden und einmal Reset drücken.", "note", True)
+        self.status_label = label("Zum Mithören den USB-Port auswählen und verbinden.", "note", True)
         body.addWidget(self.status_label)
+        self.cycle_label = label("", "muted", True)
+        self.cycle_label.setToolTip("Schätzt das nächste Timer-Aufwachen aus der empfangenen Schlafmeldung. "
+                                   "WLAN, Download und Wiederholungen können den sichtbaren Bildaufbau verzögern. "
+                                   "Bei unverändertem Bild kann er entfallen. Reset oder Bewegung können früher aufwecken.")
+        body.addWidget(self.cycle_label)
         self.pages = QStackedWidget()
         self.dashboard = Dashboard()
         self.config = ConfigEditor()
@@ -166,9 +168,12 @@ class MainWindow(QMainWindow):
         footer = QHBoxLayout()
         self.wifi_button = button("WLAN verbinden", lambda: self.send("WIFI CONNECT"))
         self.run_button = button("Bild aktualisieren und schlafen", lambda: self.confirm_command("RUN"))
+        self.force_refresh_button = button("Forced refresh image", lambda: self.confirm_command("FORCE REFRESH IMAGE"))
+        self.force_refresh_button.setToolTip("Baut das gespeicherte Bild ohne Serverabruf vollständig neu auf.")
         self.reboot_button = button("Neustart", lambda: self.confirm_command("REBOOT"))
         footer.addWidget(self.wifi_button)
         footer.addWidget(self.run_button)
+        footer.addWidget(self.force_refresh_button)
         footer.addStretch()
         footer.addWidget(self.reboot_button)
         body.addLayout(footer)
@@ -176,6 +181,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.controller.state_changed.connect(self.connection_changed)
         self.controller.log_received.connect(self.log.append)
+        self.controller.log_received.connect(self.dashboard.power_card.observe_line)
         self.controller.reply_received.connect(self.handle_reply)
         self.controller.problem.connect(self.show_problem)
         self.dashboard.refresh_requested.connect(lambda: self.send("DIAG"))
@@ -191,10 +197,11 @@ class MainWindow(QMainWindow):
         self.firmware_job.progress.connect(self.update_progress)
         self.firmware_job.completed.connect(self.firmware_finished)
         self.ports.currentTextChanged.connect(self.update_controls)
-        self.poll = QTimer(self)
-        self.poll.setInterval(15000)
-        self.poll.timeout.connect(self.poll_diagnostics)
-        self.poll.start()
+        self.cycle_timer = QTimer(self)
+        self.cycle_timer.setInterval(1000)
+        self.cycle_timer.timeout.connect(self.update_cycle_estimate)
+        self.cycle_timer.start()
+        self.update_cycle_estimate()
         self.select_page(0)
         self.scan_ports()
         self.refresh_artifact()
@@ -208,7 +215,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
         self.command = QComboBox()
-        self.command.addItems(["HELP", "DIAG", "CONFIG GET", "WIFI CONNECT", "RUN", "REBOOT", "B"])
+        self.command.addItems(["HELP", "DIAG", "CONFIG GET", "WIFI CONNECT", "RUN", "FORCE REFRESH IMAGE", "REBOOT", "B"])
         self.command.setToolTip("CONFIG SET ist über das geprüfte Einstellungsformular verfügbar.")
         self.command_button = button("Befehl senden", self.send_selected, True)
         row.addWidget(self.command)
@@ -298,8 +305,15 @@ class MainWindow(QMainWindow):
         for port, description, likely_panel in ports:
             self.ports.addItem(description + ("  [Panel-Kandidat]" if likely_panel else ""), port)
         chosen = self.ports.findData(current)
+        panel_ports = [port for port, _, likely_panel in ports if likely_panel]
         if chosen >= 0:
             self.ports.setCurrentIndex(chosen)
+        elif len(panel_ports) == 1:
+            self.ports.setCurrentIndex(self.ports.findData(panel_ports[0]))
+            if current:
+                message = f"Bisheriger USB-Port {current} nicht gefunden. Panel-Kandidat {panel_ports[0]} ausgewählt."
+                self.status_label.setText(message)
+                self.log.append("SYSTEM", message)
         elif current:
             self.ports.setEditText(current)
         elif not ports:
@@ -332,18 +346,21 @@ class MainWindow(QMainWindow):
 
     def connection_changed(self, state, message):
         self.status_label.setText(message)
+        self.update_cycle_estimate()
         self.update_controls()
+
+    def update_cycle_estimate(self):
+        self.cycle_label.setText(self.controller.cycle_schedule.description(connected=self.controller.connected))
 
     def update_controls(self):
         busy_job = self.firmware_job.active
         connected = self.controller.worker is not None
         ready = self.controller.state == "ready" and not busy_job and not self.demo
-        can_query = self.controller.connected and self.controller.pending is None and not self.controller.wifi_wait and not busy_job and not self.demo
+        can_query = self.controller.connected and self.controller.state != "updating" and self.controller.pending is None and not self.controller.wifi_wait and not busy_job and not self.demo
         self.ports.setEnabled(not connected and not busy_job and not self.demo)
         self.scan_button.setEnabled(not connected and not busy_job and not self.demo)
         self.connect_button.setEnabled(not busy_job and not self.demo)
         self.connect_button.setText("Trennen" if connected else "Verbinden")
-        self.live.setEnabled(not self.demo)
         self.dashboard.refresh_button.setEnabled(can_query)
         self.dashboard.export_button.setEnabled(bool(self.dashboard.snapshot))
         self.config.reload_button.setEnabled(can_query)
@@ -352,7 +369,7 @@ class MainWindow(QMainWindow):
         self.config.import_button.setEnabled(bool(self.config.baseline) and not busy_job)
         self.config.export_button.setEnabled(bool(self.config.baseline))
         self.command_button.setEnabled(can_query)
-        for item in (self.wifi_button, self.run_button, self.reboot_button):
+        for item in (self.wifi_button, self.run_button, self.force_refresh_button, self.reboot_button):
             item.setEnabled(ready)
         can_build = not busy_job and not self.demo
         self.build_button.setEnabled(can_build)
@@ -372,7 +389,7 @@ class MainWindow(QMainWindow):
 
     def send_selected(self):
         command = self.command.currentText()
-        if command in {"RUN", "REBOOT", "B"}:
+        if command in {"RUN", "FORCE REFRESH IMAGE", "REBOOT", "B"}:
             self.confirm_command(command)
         elif command == "CONFIG GET":
             self.reload_config()
@@ -386,6 +403,7 @@ class MainWindow(QMainWindow):
     def confirm_command(self, command: str):
         descriptions = {
             "RUN": "Gespeicherte Einstellungen verwenden, das Bild aktualisieren und anschließend schlafen?",
+            "FORCE REFRESH IMAGE": "Das lokal gespeicherte Bild ohne Serverabruf vollständig neu aufbauen und anschließend schlafen?",
             "REBOOT": "Das Panel jetzt neu starten?",
             "B": "Das Panel in den ROM-Bootloader versetzen? Zum Start der Firmware ist anschließend ggf. Reset nötig.",
         }
@@ -395,10 +413,6 @@ class MainWindow(QMainWindow):
             return
         if self.confirm(command, descriptions[command]):
             self.send(command)
-
-    def poll_diagnostics(self):
-        if self.live.isChecked() and self.controller.state == "ready" and not self.firmware_job.active and not self.demo and QApplication.activeModalWidget() is None:
-            self.send("DIAG")
 
     def handle_reply(self, reply: dict):
         command = reply.get("command")
@@ -586,7 +600,6 @@ class MainWindow(QMainWindow):
             return
         if not self.demo:
             self.preferences.setValue("port", self.selected_port())
-            self.preferences.setValue("live", self.live.isChecked())
             self.preferences.setValue("uploadBaud", self.upload_speed.currentData())
         event.accept()
 
@@ -596,7 +609,7 @@ class MainWindow(QMainWindow):
         self.config.set_config(SAMPLE_DIAGNOSTICS["config"])
         self.status_label.setText("VORSCHAU · Beispieldaten · Kein Gerät verbunden · Übertragung deaktiviert")
         self.log.append("SYSTEM", "Vorschaumodus: keine serielle Verbindung und kein Flashen.")
-        self.log.append("RX", "[USB] Ready: HELP, DIAG, CONFIG GET, CONFIG SET {JSON}, WIFI CONNECT, RUN, REBOOT")
+        self.log.append("RX", "[USB] Ready: HELP, DIAG, CONFIG GET, CONFIG SET {JSON}, WIFI CONNECT, RUN, FORCE REFRESH IMAGE, REBOOT")
 
 
 def create_application() -> QApplication:

@@ -9,6 +9,7 @@ from serial.tools import list_ports
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 from .protocol import LineDecoder, command_name, parse_reply, safe_command_label
+from .schedule import CycleSchedule
 
 
 def available_ports() -> list[tuple[str, str, bool]]:
@@ -82,6 +83,8 @@ class ConsoleController(QObject):
         self.state = "disconnected"
         self.pending: str | None = None
         self.wifi_wait = False
+        self.update_in_progress = False
+        self.cycle_schedule = CycleSchedule()
         self.deadline = QTimer(self)
         self.deadline.setSingleShot(True)
         self.deadline.timeout.connect(self._timeout)
@@ -101,6 +104,7 @@ class ConsoleController(QObject):
         if self.worker is not None:
             raise RuntimeError("Die bisherige Verbindung muss zuerst geschlossen werden.")
         self.port = port
+        self.cycle_schedule.reset()
         worker = self.worker_factory(port)
         self.worker = worker
         worker.opened.connect(lambda: self._opened(worker))
@@ -115,6 +119,7 @@ class ConsoleController(QObject):
         self.wifi_timer.stop()
         self.pending = None
         self.wifi_wait = False
+        self.update_in_progress = False
         worker = self.worker
         if worker is not None:
             worker.stop()
@@ -127,17 +132,18 @@ class ConsoleController(QObject):
         return True
 
     def request(self, command: str) -> bool:
-        if not self.connected or self.state == "opening" or self.pending or self.wifi_wait:
+        if not self.connected or self.state in {"opening", "updating"} or self.pending or self.wifi_wait:
             return False
         if command == "B":
             if self.state != "ready":
                 self.problem.emit("Für diesen Befehl zuerst das Panel aufwecken und DIAG abfragen. Der Flasher kann alternativ selbst auf Reset warten.")
                 return False
             self.worker.send(b"\nB")
+            self.cycle_schedule.clear_estimate()
             self.log_received.emit("TX", "B · ROM-Bootloader anfordern")
             self._set_state("bootloader", "Bootloader angefordert. Falls nötig einmal Reset drücken.")
             return True
-        if command_name(command) not in {"DIAG", "HELP", "CONFIG GET", "CONFIG SET", "WIFI CONNECT", "RUN", "REBOOT"}:
+        if command_name(command) not in {"DIAG", "HELP", "CONFIG GET", "CONFIG SET", "WIFI CONNECT", "RUN", "FORCE REFRESH IMAGE", "REBOOT"}:
             raise ValueError("Unbekannter Konsolenbefehl.")
         if "\n" in command or "\r" in command or len(command.encode("utf-8")) > 2048:
             raise ValueError("Ungültige Befehlszeile.")
@@ -151,17 +157,46 @@ class ConsoleController(QObject):
     def _opened(self, worker) -> None:
         if worker is not self.worker:
             return
-        self._set_state("waiting", "Port offen. Falls nötig einmal Reset drücken.")
+        self._set_state("waiting", "Mithören aktiv · warte auf die nächste Panelmeldung.")
         self.log_received.emit("SYSTEM", f"{self.port} geöffnet · 115200 Baud · DTR/RTS aus")
-        self.request("DIAG")
 
     def _line(self, worker, line: str) -> None:
         if worker is not self.worker:
             return
-        self.log_received.emit("JSON" if line.startswith("[USB] {") else "RX", line)
+        self.cycle_schedule.observe_line(line)
+        kind = "JSON" if line.startswith("[USB] {") else "RX"
+        try:
+            reply = parse_reply(line)
+        except ValueError as error:
+            self.log_received.emit(kind, line)
+            self.log_received.emit("SYSTEM", str(error))
+            return
+        if reply is not None:
+            self.cycle_schedule.observe_reply(reply)
+        self.log_received.emit(kind, line)
+        if "ESP-ROM:" in line:
+            if self.update_in_progress:
+                self.problem.emit("Neustart während des Bildablaufs; ein erfolgreicher Abschluss wurde nicht bestätigt. Reset-Grund und Renderstatus in der Diagnose prüfen.")
+            self.update_in_progress = False
+            self.deadline.stop()
+            self.pending = None
+            self._set_state("waiting", "Panel startet neu.")
+        if "[WAKE] Got Timer Wakeup" in line:
+            self._set_state("waiting", "Panel durch Timer aufgewacht.")
+        if "[MAIN] Setup Mode Completed or Timeout" in line or "[USB] Session ended:" in line:
+            self.update_in_progress = True
+            self._set_state("updating", "Setup beendet · Bildzyklus läuft.")
+        if "[DL] Download Image file:" in line:
+            self.update_in_progress = True
+            self._set_state("updating", "Bildabruf vom Server läuft.")
+        if "[IMAGE] Render begin:" in line or "[EPD] Render stage:" in line or "[EPD] Render waiting:" in line:
+            self.update_in_progress = True
+            self._set_state("updating", "Bildaufbau läuft. Bitte Taster und USB-Verbindung unverändert lassen.")
+        if "[MAIN] End of Update" in line:
+            self.update_in_progress = False
         if "[USB] Ready:" in line:
             if self.pending is None:
-                self.request("DIAG")
+                self._set_state("ready", "USB-Konsole bereit · Mithören aktiv.")
             return
         if "[MAIN] test mode check" in line:
             self.deadline.stop()
@@ -169,23 +204,19 @@ class ConsoleController(QObject):
             self.wifi_wait = False
             self.wifi_timer.stop()
             self._set_state("waiting", "Panel startet. Warte auf USB-Konsole …")
-        if "[USB] Session ended:" in line or "[MAIN] Going to Sleep" in line:
+        if "[MAIN] Going to Sleep" in line:
+            self.update_in_progress = False
             self.deadline.stop()
             self.wifi_timer.stop()
             self.wifi_wait = False
             self.pending = None
-            self._set_state("sleeping", "Panel schläft oder beendet die Sitzung. Zum Verbinden Reset drücken.")
+            self._set_state("sleeping", "Panel schläft · Mithören aktiv.")
         if "ROM Download Bootloader" in line or "waiting for download" in line:
             self.deadline.stop()
             self.wifi_timer.stop()
             self.wifi_wait = False
             self.pending = None
             self._set_state("bootloader", "ROM-Bootloader aktiv")
-        try:
-            reply = parse_reply(line)
-        except ValueError as error:
-            self.log_received.emit("SYSTEM", str(error))
-            return
         if reply is None:
             return
         response_name = reply.get("command")
@@ -200,7 +231,11 @@ class ConsoleController(QObject):
             self.problem.emit(str(reply.get("error", "Das Panel hat den Befehl abgelehnt.")))
             return
         if completed == "RUN":
-            self._set_state("sleeping", "Bildaktualisierung läuft; anschließend schläft das Panel.")
+            self.update_in_progress = True
+            self._set_state("updating", "Bildablauf läuft; anschließend schläft das Panel.")
+        elif completed == "FORCE REFRESH IMAGE":
+            self.update_in_progress = True
+            self._set_state("updating", "Gespeichertes Bild wird neu aufgebaut. Bitte Taster und USB unverändert lassen.")
         elif completed == "REBOOT":
             self._set_state("waiting", "Neustart bestätigt. Warte auf USB-Konsole …")
         elif completed == "WIFI CONNECT":
@@ -226,13 +261,16 @@ class ConsoleController(QObject):
 
     def _failed(self, worker, message: str) -> None:
         if worker is self.worker:
-            self.log_received.emit("SYSTEM", f"USB-Fehler: {message}")
-            self.problem.emit(f"USB-Verbindung fehlgeschlagen: {message}")
+            details = f"USB-Verbindung fehlgeschlagen: {message}"
+            if self.update_in_progress:
+                details += " · Abschluss des Bildablaufs unbekannt. Das Panel kann noch arbeiten. Nach Wiederverbindung Diagnose prüfen."
+            self.problem.emit(details)
 
     def _finished(self, worker) -> None:
         if worker is not self.worker:
             return
         self.worker = None
+        self.update_in_progress = False
         self.deadline.stop()
         self.wifi_timer.stop()
         self.pending = None

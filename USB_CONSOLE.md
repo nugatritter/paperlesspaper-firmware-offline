@@ -43,6 +43,7 @@ Es gibt kein Eingabe-Echo der Firmware. Lokales Terminal-Echo lässt sich separa
 | `CONFIG SET {…}` | Einstellungen vollständig prüfen und gemeinsam dauerhaft speichern |
 | `WIFI CONNECT` | Verbindungsversuch mit den gespeicherten WLAN-Daten anfordern; sofortige Antwort `pending:true`, anschließend Ergebnis über Logs und `DIAG` |
 | `RUN` | Setup verlassen, normalen Bildabruf/Renderablauf ausführen und schlafen |
+| `FORCE REFRESH IMAGE` | Aktiven lokalen Bildslot vollständig neu zeichnen, ohne Bildserver oder Remote-Einstellungen abzurufen; anschließend schlafen |
 | `REBOOT` | Nach Bestätigung über USB neu starten |
 | `B` oder `b` | Bestehender Bootloader-Befehl; am Zeilenanfang sofort, auch ohne Enter |
 
@@ -64,6 +65,7 @@ Backspace und Delete entfernen das letzte eingegebene Byte.
 | `storageAtBoot` | Initialisierungsergebnisse, SPIFFS-Belegung, SerialFlash-ID/Kapazität/Löschblock sowie Adressen und reservierte Größen der drei Bild-/Downloadslots |
 | `nvs` | Aktuelle belegte, freie und gesamte NVS-Einträge, falls verfügbar |
 | `lastCompletedUpdate` | Letzter vollständig durchlaufener Bildzyklus: Download-/Renderergebnis, HTTP-Code, empfangene Bytes und Dauer beider Phasen |
+| `render` | Dauerhafter Renderstatus, letzter Versuch und Zustand beim Boot, erforderliche Wiederherstellung, Speicherfehler sowie vor dem Rendern und während der Wartephasen gemessene Batteriespannung |
 | `config` | Aktuelle Einstellungen wie bei `CONFIG GET` |
 
 Die Chiptemperatur ist keine Messung der Panel- oder Raumtemperatur. Batteriespannung,
@@ -89,6 +91,47 @@ Die Renderdauer umfasst auch Wartezeiten; sie misst nicht ausschließlich die Pa
 Für epd13 bleiben physische Landschaftsmaße **1600 × 1200** und Bildraster
 **1200 × 1600** getrennt. BUSY und gespeicherter Präsentationszustand sind
 Software-/GPIO-Informationen; die sichtbaren Pixel werden nicht zurückgelesen.
+
+`system.resetReasonName` erklärt den SDK-Resetcode, etwa `BROWNOUT`, `POWERON`,
+`TASK_WATCHDOG` oder `SOFTWARE`. `POWERON` unterscheidet einen Tastendruck am
+Reset-Pin nicht zuverlässig von einer Unterbrechung der Versorgung. Daher lautet
+die entsprechende Aufwachklassifikation jetzt `power-on-or-reset-pin`, nicht `button`.
+Der ESP32-C6 hat einen Kern; der Bootlog gibt nur dessen ROM-Resetgrund aus.
+
+Der Renderstatus wird in einem 28-Byte-Datensatz ab EEPROM-Adresse 1340 gespeichert.
+Er überlebt auch einen Verlust des RTC-RAMs. `preparing`, `streaming` und `refreshing`
+sind unvollständige Phasen. Erst nach erfolgreicher BUSY-Prüfung werden `complete`
+und die abgeschlossene Präsentation gemeinsam gespeichert. `failed` bleibt
+wiederholbar. Beim nächsten regulären Bildablauf erzwingt ein unvollständiger
+Datensatz auch nach HTTP 304 einen vollständigen Neuaufbau. Eine bloße Reparatur
+des Overlay-Fensters reicht nach einem abgebrochenen Vollbild-Refresh nicht aus.
+Bei unerreichbarem Server wird vor einem Fehleroverlay zunächst das gespeicherte
+Vollbild wiederhergestellt, sofern dessen letzter Render unvollständig war.
+
+`render.atBoot` ist der beim Start vorgefundene Datensatz; `render.lastAttempt`
+zeigt den aktuellen beziehungsweise letzten Versuch. `interruptedAtBoot` bedeutet,
+dass beim Start ein begonnener Versuch ohne Abschluss vorlag. Es benennt nicht
+die Resetursache. `elapsedMsAtCheckpoint` ist die Zeit bis zum gespeicherten
+Zwischenstand und nicht die genaue Zeit bis zu einem späteren Stromverlust.
+
+Während der BUSY-Wartephasen wird etwa jede Sekunde die Batteriespannung gemessen.
+`[EPD] Render waiting` erscheint bei einem BUSY-Pegelwechsel, einer Spannungsänderung
+von mindestens 500 mV gegenüber der letzten Meldung oder nach zehn Sekunden ohne
+Meldung. Sie enthält Phase, Laufzeit, BUSY-Pegel, Batteriespannung und Messminimum.
+Die Messungen erfassen die Batterie über den vorhandenen ADC, nicht die interne
+3,3-V-Versorgung. Kurze Einbrüche zwischen den Stichproben bleiben unentdeckt.
+Einzelne Messwerte werden nicht laufend ins EEPROM geschrieben; nach einem Reset
+enthält der Datensatz nur die Werte des letzten gespeicherten Zwischenstands.
+
+Im Setup erscheint `[BAT]` beim ersten Messwert und danach erst ab einer Änderung
+von 500 mV gegenüber dem zuletzt gemeldeten Wert. Lade- und LED-Status werden nur
+bei Änderungen ausgegeben. Die Messungen und die Fehlerausgaben bleiben aktiv;
+manuelles `DIAG` liefert weiterhin den vollständigen aktuellen Datensatz.
+
+Während des Bildaufbaus pausiert das Laden und die Status-LED ist aus. Nach dem
+Versuch wird die gespeicherte Ladeeinstellung wieder angewendet. Der Failsafe
+erhält vor jedem Render ein neues Zeitbudget, damit vorherige Download-Retries
+keinen laufenden Refresh wegen Zeitablaufs abschalten.
 
 ## Konfigurierbare Werte
 
