@@ -31,3 +31,18 @@ def apply_env_vars():
         print(f"Error processing .env: {e}")
 
 apply_env_vars()
+if env.subst("$PIOENV").endswith("-managed"):
+    from pathlib import Path
+
+    trust_path = Path(os.environ.get("PANEL_TRUST_CONFIG", "")).expanduser().resolve()
+    if not trust_path.is_file():
+        raise ValueError("Set PANEL_TRUST_CONFIG to the managed service's public trust header")
+    env.Append(CPPDEFINES=[("PANEL_TRUST_CONFIG", env.StringifyMacro(trust_path.as_posix()))])
+    emergency_path = os.environ.get("PANEL_EMERGENCY_CONFIG")
+    if emergency_path:
+        issuer_path = Path(emergency_path).expanduser().resolve(strict=True)
+        env.Append(CPPDEFINES=[("PANEL_EMERGENCY_CONFIG", env.StringifyMacro(issuer_path.as_posix()))])
+    fixed_image_path = os.environ.get("PANEL_FIXED_IMAGE_CONFIG")
+    if fixed_image_path:
+        fixed_image_header = Path(fixed_image_path).expanduser().resolve(strict=True)
+        env.Append(CPPDEFINES=[("PANEL_FIXED_IMAGE_CONFIG", env.StringifyMacro(fixed_image_header.as_posix()))])

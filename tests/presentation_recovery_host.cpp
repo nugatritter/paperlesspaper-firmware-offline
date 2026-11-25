@@ -7,16 +7,29 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include "render_journal.h"
 using std::min;
 using String = std::string;
 constexpr uint8_t DISPLAY_PICTURE = 0;
 constexpr uint8_t DISPLAY_ERROR_TEXT = 2;
+constexpr uint8_t DISPLAY_USB_NOTICE = 5;
+constexpr int RENDER_USB_REQUIRED = -11;
+constexpr int PENDING_IMAGE_ADDRESS = 1332;
+constexpr int PENDING_IMAGE_MARKER = 0x53;
+bool usbPower = true;
+bool hasBacking = true;
+int warningCalls = 0;
+bool usbCheckConnect() { return usbPower; }
+bool hasValidFlashImage(const char *) { return hasBacking; }
 constexpr uint8_t DISPLAY_ERROR_OVERLAY = 4;
 constexpr int EEPROM_DISPLAY_CONTENT_ADR = 230;
 constexpr int EEPROM_SIZE = 2048;
 constexpr int FAILSAVE_TIMER = 180;
 constexpr int BUSY_PIN = 18;
+#ifdef EPD_TYPE_13INCH
+constexpr int BAT_OFF_VALUE = 4000;
+#endif
 uint8_t desiredPresentation;
 uint8_t renderedPresentation;
 bool renderPending;
@@ -81,11 +94,27 @@ int performRender() {
    return renderResult;
 }
 int setImageFromFS(const String &) { fullCalls++; return performRender(); }
-int restoreImageErrorOverlay(const String &) { partialCalls++; return performRender(); }
+int restoreImageErrorOverlay(const String &, bool) { partialCalls++; return performRender(); }
+
+int showUsbPowerOverlay(const String &) { warningCalls++; return performRender(); }
+uint8_t displayContent() { return EEPROM.read(EEPROM_DISPLAY_CONTENT_ADR); }
+bool newImageNeedsRender() { return EEPROM.read(PENDING_IMAGE_ADDRESS) == PENDING_IMAGE_MARKER; }
+
+std::vector<unsigned> attemptedWindows;
+int cutDuringWindow = -1;
+bool renderStoredQuarter(unsigned quarter) {
+   attemptedWindows.push_back(quarter);
+   if (int(quarter) == cutDuringWindow) throw PowerCut{};
+   return performRender() == 0;
+}
 
 // PRODUCTION_SOURCE
 
 void reset(uint8_t presentation = DISPLAY_ERROR_OVERLAY) {
+   attemptedWindows.clear();
+   cutDuringWindow = -1;
+   usbPower = hasBacking = true;
+   warningCalls = 0;
    EEPROM = {};
    EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, presentation);
    EEPROM.commit();
@@ -149,6 +178,60 @@ int main() {
       reboot();
       assert(!renderPending && renderJournal.stage == RenderStage::Complete);
    }
+
+   reset(DISPLAY_PICTURE);
+   usbPower = false;
+   assert(showStoredImage("slot") == RENDER_USB_REQUIRED);
+   assert(fullCalls == 0 && partialCalls == 0);
+#ifdef EPD_TYPE_13INCH
+   assert(warningCalls == 1 && displayContent() == DISPLAY_USB_NOTICE);
+   reboot();
+   assert(validRenderJournal(renderJournal));
+   assert(showStoredImage("slot", true) == RENDER_USB_REQUIRED && warningCalls == 1);
+#endif
+   usbPower = true;
+   assert(showStoredImage("slot", true) == 0);
+   checkCalls(true);
+
+#ifdef EPD_TYPE_13INCH
+   for (int cut = 0; cut < 4; ++cut) {
+      reset(DISPLAY_PICTURE);
+      usbPower = false;
+      EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+      EEPROM.write(QUARTER_PROGRESS_ADDRESS, QUARTER_START);
+      cutDuringWindow = cut;
+      try { showStoredImage("slot"); assert(false); } catch (const PowerCut &) {}
+      reboot();
+      assert(quartersPending() && !quarterCleanupDue());
+      assert(EEPROM.read(QUARTER_PROGRESS_ADDRESS) == QUARTER_START + cut);
+      attemptedWindows.clear();
+      cutDuringWindow = -1;
+      assert(showStoredImage("slot") == 0 && fullCalls == 0);
+      assert(attemptedWindows.size() == unsigned(4 - cut) && attemptedWindows.front() == unsigned(cut));
+      assert(!newImageNeedsRender() && !quartersPending() && quarterCleanupDue());
+      reboot();
+      assert(quarterCleanupDue() && !renderPending);
+      usbPower = true;
+      assert(showStoredImage("slot", true) == 0 && fullCalls == 1 && partialCalls == 0);
+      assert(!quarterCleanupDue());
+   }
+   reset(DISPLAY_PICTURE);
+   usbPower = false;
+   EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+   EEPROM.write(QUARTER_PROGRESS_ADDRESS, QUARTER_START + 2);
+   batteryMv = BAT_OFF_VALUE - 1;
+   assert(showStoredImage("slot") < 0 && attemptedWindows.empty() && quartersPending());
+   assert(EEPROM.read(QUARTER_PROGRESS_ADDRESS) == QUARTER_START + 2);
+#else
+   EEPROM.write(QUARTER_PROGRESS_ADDRESS, QUARTER_START);
+   assert(!quartersPending() && !quarterCleanupDue());
+#endif
+
+   reset(DISPLAY_ERROR_OVERLAY);
+   EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+   assert(showStoredImage("new-slot", true) == 0);
+   checkCalls(false);
+   assert(!newImageNeedsRender());
 
    for (const bool busyTimeout : {false, true}) {
       reset();

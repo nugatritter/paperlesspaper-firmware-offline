@@ -46,6 +46,10 @@ inline const char *validateSerialConfig(JsonVariantConst input) {
          }
       }
    }
+#ifdef PANEL_TRUST_CONFIG
+   if (input["requireImageDigest"].is<bool>() && !input["requireImageDigest"].as<bool>())
+      return "Managed panels require an image digest";
+#endif
    if (input["chargerMode"].as<bool>() && !input["confirmRechargeable"].as<bool>())
       return "Enabling charging requires confirmRechargeable:true (rechargeable batteries only)";
    return nullptr;

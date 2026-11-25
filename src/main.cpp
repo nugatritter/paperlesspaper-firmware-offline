@@ -23,14 +23,24 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <esp_ota_ops.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/sha256.h>
 #include <rom/crc.h>
 #include <rom/rtc.h>
 #include <soc/lp_aon_reg.h>
 
 #include "chunked_decoder.h"
+#include "image_digest.h"
+#ifdef PANEL_TRUST_CONFIG
+#include "panel_https.h"
+#include "managed_profile.h"
+#endif
 #include "render_journal.h"
 #include "reset_diagnostics.h"
 #include "epaper_display.h"
+#ifdef EPD_TYPE_13INCH
+#include "epaper_partial_13.h"
+#endif
 #include "types.h"
 #include "serial_line.h"
 #include "serial_config.h"
@@ -125,6 +135,8 @@
 #define DL_INCOMPLETE -4     // the connection was lost during the download
 #define DL_TOO_LARGE -5      // the file does not fit into the flash
 #define DL_FLASH_ERROR -8
+#define DL_DIGEST_ERROR -9
+#define DL_FORMAT_ERROR -10
 
 #define EEPROM_DISPLAY_CONTENT_ADR 230
 #define DISPLAY_PICTURE 0    // a picture, or unknown
@@ -132,6 +144,7 @@
 #define DISPLAY_ERROR_TEXT 2 // "picture download failed"
 #define DISPLAY_BATTERY_EMPTY 3
 #define DISPLAY_ERROR_OVERLAY 4
+#define DISPLAY_USB_NOTICE 5
 
 #define BAT_OFF_VALUE 4000 // mV (4 cells): below this the frame only sleeps when it runs on batteries
 
@@ -218,6 +231,52 @@ static NimBLEServer *pServer;
 int periodicLedTimeout = 0;
 int httpFileSize = 0;
 String tempLastModified = "";
+String downloadedDigest;
+String activeImageDigest;
+constexpr int IMAGE_DIGEST_ADDRESS = 1400;
+constexpr int PENDING_IMAGE_ADDRESS = 1332;
+constexpr uint8_t PENDING_IMAGE_MARKER = 0x53;
+static_assert(PENDING_IMAGE_ADDRESS < RENDER_JOURNAL_ADDRESS);
+static bool newImageNeedsRender() {
+   return EEPROM.read(PENDING_IMAGE_ADDRESS) == PENDING_IMAGE_MARKER;
+}
+static_assert(RENDER_JOURNAL_ADDRESS + sizeof(RenderJournal) <= IMAGE_DIGEST_ADDRESS);
+static_assert(IMAGE_DIGEST_ADDRESS + 45 <= EEPROM_SIZE);
+#ifdef PANEL_TRUST_CONFIG
+constexpr int PROFILE_REVISION_ADDRESS = 1452;
+static_assert(IMAGE_DIGEST_ADDRESS + 45 <= PROFILE_REVISION_ADDRESS);
+static_assert(PROFILE_REVISION_ADDRESS + sizeof(uint32_t) <= EEPROM_SIZE);
+static uint32_t activeProfileRevision = 0;
+#endif
+// The staged slot, validator, orientation and next window are committed together.
+constexpr int QUARTER_PROGRESS_ADDRESS = 1460;
+constexpr int QUARTER_ROTATION_ADDRESS = 1461;
+constexpr uint8_t QUARTER_START = 0xA0;
+constexpr uint8_t QUARTER_CLEANUP_DUE = 0xB1;
+static_assert(1452 + sizeof(uint32_t) <= QUARTER_PROGRESS_ADDRESS && QUARTER_ROTATION_ADDRESS < 1500);
+static bool quartersPending() {
+#ifdef EPD_TYPE_13INCH
+   const uint8_t progress = EEPROM.read(QUARTER_PROGRESS_ADDRESS);
+   return progress >= QUARTER_START && progress <= QUARTER_START + 4 && newImageNeedsRender();
+#else
+   return false;
+#endif
+}
+static bool quarterCleanupDue() {
+#ifdef EPD_TYPE_13INCH
+   return EEPROM.read(QUARTER_PROGRESS_ADDRESS) == QUARTER_CLEANUP_DUE;
+#else
+   return false;
+#endif
+}
+#ifdef PANEL_EMERGENCY_CONFIG
+constexpr int EMERGENCY_ACTIVE_ADDRESS = 1578;
+constexpr uint8_t EMERGENCY_ACTIVE_MARKER = 0xEC;
+static bool emergencyImageActive() {
+   return EEPROM.read(EMERGENCY_ACTIVE_ADDRESS) == EMERGENCY_ACTIVE_MARKER ||
+          settings.lastModified.startsWith("emergency:");
+}
+#endif
 int StartCounter = 0;
 uint16_t bleWriteBufferPos = 0;
 uint32_t bleBytesReceived = 0;
@@ -310,6 +369,13 @@ static uint32_t alignFlashAddress(uint32_t address, uint32_t blockSize);
 void ledBlink(int timeout, bool on, int dimValue = 100);
 void debugFS(void);
 bool BleInit(String deviceId, bool enable);
+#ifdef PANEL_EMERGENCY_CONFIG
+namespace emergency {
+   static bool enable(const String &, bool);
+   static void poll();
+   static void rememberGeneration(const String &);
+}
+#endif
 void writeIntToFlash(int value, int startAddr, bool commit = true);
 void writeStringToFlash(const char *toStore, int startAddr, int maxLen = MAX_SETTING_STRING_LEN, bool commit = true);
 int storeSleepTimeMem(int updateTime = 0);
@@ -1067,6 +1133,7 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
    const uint16_t bpp = readLe16(header + 28);
    const uint32_t compression = readLe32(header + 30);
    const uint32_t colorsUsed = readLe32(header + 46);
+   if (rawHeight == INT32_MIN) return false;
    const bool topDown = rawHeight < 0;
    const int32_t height = topDown ? -rawHeight : rawHeight;
 
@@ -1080,14 +1147,20 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
    const uint32_t fileLen = (lastDownloadedBytes > 0 && lastDownloadedBytes <= inFile.size())
                                 ? lastDownloadedBytes
                                 : (inFile.size() == (uint32_t)IMG_WIDTH * IMG_HEIGHT / 2 ? inFile.size() : 0);
-   if ((uint64_t)pixelOffset + (uint64_t)stride * height > fileLen) {
+   const uint32_t paletteEntries = bpp == 4 ? (colorsUsed ? colorsUsed : 16) : 0;
+   const uint64_t metadataEnd = 14ULL + dibSize + 4ULL * paletteEntries +
+                                (compression == 3 && dibSize == 40 ? 12 : 0);
+   if (readLe16(header + 26) != 1 || readLe32(header + 2) != fileLen || paletteEntries > 16 ||
+       metadataEnd > pixelOffset || (uint64_t)pixelOffset + (uint64_t)stride * height > fileLen) {
       Serial.println("[IMAGE] BMP is incomplete");
       return false;
    }
 
-   if (bpp == 4 && topDown && width == IMG_WIDTH && height == IMG_HEIGHT) {
-      Serial.println("[IMAGE] 4-bit BMP detected. Already dithered.");
-      return copyDisplayImage(inFile, outFileName);
+   if (compression == 3) {
+      uint8_t masks[12];
+      inFile.seek(54);
+      if ((dibSize != 40 && dibSize < 52) || inFile.read(masks, sizeof(masks)) != sizeof(masks) ||
+          readLe32(masks) != 0xff0000 || readLe32(masks + 4) != 0xff00 || readLe32(masks + 8) != 0xff) return false;
    }
 
    Serial.printf("[IMAGE] %u-bit BMP detected. Dithering...\n", bpp);
@@ -1105,6 +1178,30 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
          palette[i][0] = entry[2];
          palette[i][1] = entry[1];
          palette[i][2] = entry[0];
+      }
+      if (topDown && width == IMG_WIDTH && height == IMG_HEIGHT && colors >= 7) {
+         bool nativePalette = true;
+         for (uint32_t i = 0; i <= 6; ++i) {
+            const uint32_t rgb = (uint32_t(palette[i][0]) << 16) | (uint32_t(palette[i][1]) << 8) | palette[i][2];
+            if (i != 4 && rgb != acep_palette[i]) nativePalette = false;
+         }
+         if (nativePalette) {
+            uint8_t pixels[512];
+            inFile.seek(pixelOffset);
+            uint32_t remaining = stride * height;
+            bool nativePixels = true;
+            while (remaining && nativePixels) {
+               const uint32_t count = min(remaining, (uint32_t)sizeof(pixels));
+               if (inFile.read(pixels, count) != count) return false;
+               for (uint32_t i = 0; i < count; ++i) {
+                  const uint8_t left = pixels[i] >> 4, right = pixels[i] & 15;
+                  if (left >= colors || right >= colors) return false;
+                  if (left == 4 || left > 6 || right == 4 || right > 6) nativePixels = false;
+               }
+               remaining -= count;
+            }
+            if (nativePixels) return copyDisplayImage(inFile, outFileName);
+         }
       }
    }
 
@@ -1139,6 +1236,7 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
          const int sx = (int)((int64_t)ox * width / conv.outW);
          if (bpp == 4) {
             const uint8_t index = (sx % 2 == 0) ? (srcRow[sx / 2] >> 4) : (srcRow[sx / 2] & 0x0F);
+            if (index >= paletteEntries) { ok = false; break; }
             *dst++ = palette[index][0];
             *dst++ = palette[index][1];
             *dst++ = palette[index][2];
@@ -1150,7 +1248,7 @@ static bool convertBmp(SerialFlashFile &inFile, const char *outFileName) {
             *dst++ = p[0];
          }
       }
-      if (!convWriteRow())
+      if (ok && !convWriteRow())
          ok = false;
    }
    free(srcRow);
@@ -1544,7 +1642,14 @@ bool saveSettingsToFlash(int startAddr) {
    writeIntToFlash(settings.sleepDisabled, startAddr + 15, false);
    writeIntToFlash(settings.imageMode, startAddr + 20, false);
    writeStringToFlash(settings.downloadUrl.c_str(), startAddr + 25, maxLen, false);
-   writeStringToFlash(settings.lastModified.c_str(), startAddr + 155, maxLen, false);
+   // Mark a validator issued for a verified image. Older firmware replaces this
+   // field on its next successful download, invalidating the proof on upgrade.
+   String storedValidator = settings.lastModified;
+   if (activeImageDigest.length() == 44 && storedValidator.length()) {
+      storedValidator = storedValidator.length() + 2 <= maxLen ? "v:" + storedValidator : String("");
+   }
+   writeStringToFlash(storedValidator.c_str(), startAddr + 155, maxLen, false);
+   writeStringToFlash(activeImageDigest.c_str(), IMAGE_DIGEST_ADDRESS, 44, false);
    writeStringToFlash(settings.httpAuthUser.c_str(), startAddr + 285, maxLen, false);
    writeStringToFlash(settings.httpAuthPassword.c_str(), startAddr + 415, maxLen, false);
    writeIntToFlash(settings.motionWakeup, startAddr + 545, false);
@@ -1570,6 +1675,11 @@ void restoreSettingsToFlash(int startAddr) {
    settings.imageMode = readIntFromFlash(startAddr + 20);
    settings.downloadUrl = readStringFromFlash(startAddr + 25);
    settings.lastModified = readStringFromFlash(startAddr + 155);
+   activeImageDigest = "";
+   if (settings.lastModified.startsWith("v:")) {
+      settings.lastModified.remove(0, 2);
+      activeImageDigest = readStringFromFlash(IMAGE_DIGEST_ADDRESS);
+   }
    settings.httpAuthUser = readStringFromFlash(startAddr + 285);
    settings.httpAuthPassword = readStringFromFlash(startAddr + 415);
    settings.motionWakeup = readIntFromFlash(startAddr + 545);
@@ -1578,7 +1688,14 @@ void restoreSettingsToFlash(int startAddr) {
    settings.settingsLastModified = readStringFromFlash(startAddr + 685);
    int autoRot = readIntFromFlash(startAddr + 815);
    settings.autoRotation = (autoRot == 0) ? false : true;
+#ifdef PANEL_TRUST_CONFIG
+   settings.requireImageDigest = true;
+   EEPROM.get(PROFILE_REVISION_ADDRESS, activeProfileRevision);
+   if (activeProfileRevision == UINT32_MAX) activeProfileRevision = 0;
+   if (!activeProfileRevision) settings.settingsLastModified = "";
+#else
    settings.requireImageDigest = readIntFromFlash(startAddr + 820) == 1;
+#endif
    const int activeSlot = readIntFromFlash(startAddr + 824);
    settings.activeSlot = (activeSlot == 1) ? 1 : 0;
    settings.manualOrientation = readIntFromFlash(startAddr + 828) == 1 ? 1 : 0;
@@ -1591,6 +1708,21 @@ void restoreSettingsToFlash(int startAddr) {
 // Device status for the server, sent with every request to the image and settings URL.
 // The values are the ones taken at wake-up (battery voltage before WiFi was switched on).
 void addTelemetryHeaders(HTTPClient &http) {
+#ifdef PANEL_TRUST_CONFIG
+   http.addHeader("X-Panel-Profile-Revision", String(activeProfileRevision));
+   const bool journalValid = renderJournalStorageOk && validRenderJournal(renderJournal);
+   http.addHeader("X-Panel-Render-Stage", journalValid ? renderStageName(renderJournal.stage) : "none");
+   if (journalValid) http.addHeader("X-Panel-Render-Attempt", String(renderJournal.attempt));
+   if (lastUpdateDiagnostics.valid) {
+      const int result = lastUpdateDiagnostics.downloadResult < 0 ? lastUpdateDiagnostics.downloadResult : lastUpdateDiagnostics.renderResult;
+      http.addHeader("X-Panel-Update-Result", String(result));
+   }
+   if (journalValid && renderJournal.stage == RenderStage::Complete && renderJournal.target == DISPLAY_PICTURE &&
+       renderJournal.slot == settings.activeSlot && !newImageNeedsRender() && activeImageDigest.length() == 44 &&
+       EEPROM.read(EEPROM_DISPLAY_CONTENT_ADR) == DISPLAY_PICTURE && settings.lastModified.startsWith("etag:")) {
+      http.addHeader("X-Panel-Displayed-ETag", settings.lastModified.substring(5));
+   }
+#endif
    http.addHeader("X-OpenPaper-Battery-Millivolts", String(systemData.vddValue));
    http.addHeader("X-OpenPaper-USB-Connected", systemData.usbConnected ? "1" : "0");
    http.addHeader("X-OpenPaper-Charging", systemData.charging ? "1" : "0");
@@ -1631,6 +1763,9 @@ static String urlOrigin(const String &url) {
 
 // sendAuth: send the HTTP login of the picture download with the request
 String getRedirect(String url, bool sendAuth = true) {
+#ifdef PANEL_TRUST_CONFIG
+   return url;
+#else
    // Redirects within one protocol are followed by the download itself. Only the change from
    // http:// to https:// needs this extra request.
    if (!url.startsWith("http://"))
@@ -1665,10 +1800,12 @@ String getRedirect(String url, bool sendAuth = true) {
       }
    }
    return url;
+#endif
 }
 
 // loadImageFromWeb removed from here since it's defined later
 
+#ifndef PANEL_TRUST_CONFIG
 uint16_t getBleMaxChunkPayload(NimBLEConnInfo &connInfo) {
    uint16_t mtu = pServer ? pServer->getPeerMTU(connInfo.getConnHandle()) : blePeerMtu;
    if (mtu < 23)
@@ -2025,10 +2162,13 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks
                   const uint8_t targetSlot = candidateImageSlot();
                   bleFile.close();
                   bleFile = SerialFlashFile();
-                  if (copyStagedImageToSlot(DOWNLOAD_SLOT_NAME, imageSlotName(targetSlot), bleBytesReceived)) {
+                  if (!quartersPending() && usbCheckConnect() && copyStagedImageToSlot(DOWNLOAD_SLOT_NAME, imageSlotName(targetSlot), bleBytesReceived) && usbCheckConnect()) {
+                     EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+                     EEPROM.write(QUARTER_PROGRESS_ADDRESS, 0);
                      bleFinalFlashCrc = flashCrc;
                      settings.activeSlot = targetSlot;
                      settings.imageMode = 0;
+                     activeImageDigest = "";
                      settings.lastModified = "";
                      saveSettingsToFlash(EEPROM_SETTINGS_ADR);
                   }
@@ -2256,6 +2396,7 @@ class DescriptorCallbacks : public NimBLEDescriptorCallbacks
       Serial.printf("[BLE] %s Descriptor read\n", pDescriptor->getUUID().toString().c_str());
    }
 } dscCallbacks;
+#endif
 
 // System info for the BLE client. setupTimeout: the frame ends the setup mode on its own.
 static String systemInfoJson(bool isCharging, bool setupTimeout = false) {
@@ -2278,6 +2419,13 @@ static String systemInfoJson(bool isCharging, bool setupTimeout = false) {
 }
 
 bool BleInit(String deviceId, bool enable) {
+#ifdef PANEL_EMERGENCY_CONFIG
+   return emergency::enable(deviceId, enable);
+#elif defined(PANEL_TRUST_CONFIG)
+   // The legacy GATT service grants writes to every connected central.
+   // Managed commissioning uses the physically secured workshop port.
+   return !enable;
+#else
    if (!enable) {
       if (wifiSettings.bleInitOk) {
          ledBlink(500, true);
@@ -2421,14 +2569,50 @@ bool BleInit(String deviceId, bool enable) {
    Serial.printf("[BLE] BLE Advertising started: %s \n", deviceId.c_str());
    wifiSettings.bleInitOk = true;
    return true;
+#endif
 }
-// https://forum.arduino.cc/index.php?topic=565603.0
+static bool verifyDownloadedDigest(SerialFlashFile &file, uint32_t length, const char *expected) {
+   prepareSpiBusForFlash();
+   if (!waitFlashReady() || !length || length > file.size()) return false;
+   file.seek(0);
+   mbedtls_sha256_context hash;
+   mbedtls_sha256_init(&hash);
+   bool ok = mbedtls_sha256_starts(&hash, 0) == 0;
+   uint8_t scratch[1024];
+   while (ok && length) {
+      const uint32_t count = min(length, (uint32_t)sizeof(scratch));
+      ok = file.read(scratch, count) == count && mbedtls_sha256_update(&hash, scratch, count) == 0;
+      length -= count;
+   }
+   uint8_t digest[32];
+   ok = ok && mbedtls_sha256_finish(&hash, digest) == 0;
+   mbedtls_sha256_free(&hash);
+   uint8_t encoded[45];
+   size_t encodedLength = 0;
+   return ok && mbedtls_base64_encode(encoded, sizeof(encoded), &encodedLength, digest, sizeof(digest)) == 0 &&
+          encodedLength == 44 && memcmp(encoded, expected, encodedLength) == 0;
+}
+
 int downloadAndSaveFile(String fileName, String url) {
    int success = 0;
    tempLastModified = "";
+   downloadedDigest = "";
    lastDownloadedBytes = 0;
    serverSleepSeconds = 0;
    WiFi.setSleep(false);
+#ifdef PANEL_TRUST_CONFIG
+   PanelSecureClient secureClient;
+   HTTPClient http;
+   http.setTimeout(10000);
+#ifdef PANEL_FIXED_IMAGE_CONFIG
+   secureClient.fixedImage = url == fixedImageUrl;
+   if (secureClient.fixedImage) {
+      http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+      if (!http.begin(secureClient, url)) return DL_REQUEST_FAILED;
+   } else
+#endif
+   if (!beginPanelRequest(http, secureClient, url)) return DL_REQUEST_FAILED;
+#else
    WiFiClientSecure secureClient;
    secureClient.setInsecure();
    HTTPClient http;
@@ -2444,13 +2628,19 @@ int downloadAndSaveFile(String fileName, String url) {
       Serial.println("[DL] Download HTTP");
       http.begin(url);
    }
+#endif
 
-   if (settings.httpAuthUser.length() > 0) {
+   if (settings.httpAuthUser.length() > 0
+#ifdef PANEL_FIXED_IMAGE_CONFIG
+       && !secureClient.fixedImage
+#endif
+   ) {
       http.setAuthorization(settings.httpAuthUser.c_str(), settings.httpAuthPassword.c_str());
       Serial.println("[DL] HTTP Auth enabled");
    }
 
-   bool canSkipIfUnchanged = !settings.forceDownload && hasValidFlashImage(activeImageSlotName());
+   bool canSkipIfUnchanged = !settings.forceDownload && hasValidFlashImage(activeImageSlotName()) &&
+                             (!settings.requireImageDigest || activeImageDigest.length() == 44);
    if (canSkipIfUnchanged && settings.lastModified.length() > 0) {
       if (settings.lastModified.startsWith("etag:"))
          http.addHeader("If-None-Match", settings.lastModified.substring(5));
@@ -2458,16 +2648,24 @@ int downloadAndSaveFile(String fileName, String url) {
          http.addHeader("If-Modified-Since", settings.lastModified);
    }
 
-   const char *headerKeys[] = {"Last-Modified", "ETag", "X-OpenPaper-Sleep-Seconds", "Transfer-Encoding"};
-   http.collectHeaders(headerKeys, 4);
+   const char *headerKeys[] = {"Last-Modified", "ETag", "X-OpenPaper-Sleep-Seconds", "Transfer-Encoding", "Content-Digest"};
+   http.collectHeaders(headerKeys, 5);
    addTelemetryHeaders(http);
 
+#ifdef PANEL_TRUST_CONFIG
+#ifdef PANEL_FIXED_IMAGE_CONFIG
+   int httpCode = secureClient.fixedImage ? http.GET() : getPanelResponse(http);
+#else
+   int httpCode = getPanelResponse(http);
+#endif
+#else
    int httpCode = http.GET();
+#endif
    int srvSleep = http.header("X-OpenPaper-Sleep-Seconds").toInt();
    diagnosticHttpStatus = httpCode;
    uint32_t srvSleepAtMs = millis();
 
-   if (httpCode == HTTP_CODE_NOT_MODIFIED && canSkipIfUnchanged) {
+   if (httpCode == HTTP_CODE_NOT_MODIFIED && canSkipIfUnchanged && settings.lastModified.length()) {
       Serial.println("[DL] Image unchanged (HTTP 304); skipping download.");
       if (srvSleep >= 60 && srvSleep <= 86400) {
          serverSleepSeconds = srvSleep;
@@ -2480,6 +2678,13 @@ int downloadAndSaveFile(String fileName, String url) {
    if (httpCode > 0) {
       // file found at server
       if (httpCode == HTTP_CODE_OK) {
+         char expectedDigest[45];
+         const auto digest = readImageDigest(http.header("Content-Digest").c_str(), expectedDigest);
+         if (digest == ImageDigestResult::Invalid || (settings.requireImageDigest && digest != ImageDigestResult::Present)) {
+            Serial.println("[DL] Required SHA-256 missing or invalid Content-Digest");
+            http.end();
+            return DL_DIGEST_ERROR;
+         }
          String etag = http.header("ETag");
          etag.trim();
          String lastMod = http.header("Last-Modified");
@@ -2492,7 +2697,8 @@ int downloadAndSaveFile(String fileName, String url) {
          const bool validatorMatches = settings.lastModified.startsWith("etag:")
                                            ? (etag.length() > 0 && ("etag:" + etag) == settings.lastModified)
                                            : (etag.length() == 0 && lastMod.length() > 0 && lastMod == settings.lastModified);
-         if (canSkipIfUnchanged && validator.length() > 0 && validatorMatches) {
+         const bool unchanged = canSkipIfUnchanged && validator.length() > 0 && validatorMatches;
+         if (unchanged && digest == ImageDigestResult::Missing) {
             Serial.println("[DL] File not modified, skipping download.");
             if (srvSleep >= 60 && srvSleep <= 86400) {
                serverSleepSeconds = srvSleep;
@@ -2604,11 +2810,19 @@ int downloadAndSaveFile(String fileName, String url) {
          }
 
          tempLastModified = validator;
+         if (digest == ImageDigestResult::Present && !verifyDownloadedDigest(saveFile, lastDownloadedBytes, expectedDigest)) {
+            Serial.println("[DL] Download slot SHA-256 differs from Content-Digest");
+            discardFlashSlot(saveFile);
+            http.end();
+            return DL_DIGEST_ERROR;
+         }
          if (srvSleep >= 60 && srvSleep <= 86400) {
             serverSleepSeconds = srvSleep;
             serverSleepReceivedMs = srvSleepAtMs;
          }
          saveFile.close();
+         if (digest == ImageDigestResult::Present) downloadedDigest = expectedDigest;
+         if (unchanged && downloadedDigest == activeImageDigest) success = DL_NOT_MODIFIED;
       }
       else {
          Serial.printf("[DL] Server answered with HTTP %d\n", httpCode);
@@ -2959,8 +3173,7 @@ static bool isRetryableImageRequestFailure(int result) {
 int loadImageFromWeb(String url, String fileName) {
    if (url.length() < 1)
       return -2;
-   Serial.print("[DL] Download Image file: ");
-   Serial.println(url);
+   Serial.println("[DL] Requesting configured image");
    // int setImage = 0; // Trigger refresh
    int downloadOk = 0;
    String newUrl = getRedirect(url);
@@ -3200,18 +3413,9 @@ bool usbInit() {
 bool usbCheckConnect() {
    Wire.beginTransmission(USBC_ADDR);
    Wire.write(0x11);
-   Wire.endTransmission(true); // end write operation, as we just wanted to select the starting register
-
-   Wire.requestFrom(USBC_ADDR, 1); // request 6 bytes from peripheral device #8
-   char c = Wire.read();           // receive a byte as character
-   char usbPower = (c >> 3) & 0x01;
-   char usbPowerLow = (c >> 6) & 0x01;
-   if (usbPower && !usbPowerLow) {
-      return true;
-   }
-   else {
-      return false;
-   }
+   if (Wire.endTransmission(true) != 0 || Wire.requestFrom(USBC_ADDR, 1) != 1) return false;
+   const int status = Wire.read();
+   return status >= 0 && (status & 0x48) == 0x08;
 }
 
 int accInit(bool skipInit) {
@@ -3405,6 +3609,12 @@ bool resetAll(bool resetWifi) {
       }
    }
    settings.activeSlot = 0;
+#ifdef PANEL_EMERGENCY_CONFIG
+   EEPROM.write(EMERGENCY_ACTIVE_ADDRESS, 0);
+#endif
+   EEPROM.write(QUARTER_PROGRESS_ADDRESS, 0);
+   EEPROM.write(PENDING_IMAGE_ADDRESS, 0);
+   activeImageDigest = "";
    settings.manualOrientation = 0;
    settings.downloadUrl = "";
    settings.lastModified = "";
@@ -3425,8 +3635,7 @@ bool resetAll(bool resetWifi) {
    }
    renderJournal = renderJournalAtBoot = {};
    EEPROM.put(RENDER_JOURNAL_ADDRESS, renderJournal);
-   saveSettingsToFlash(EEPROM_SETTINGS_ADR);
-   return true;
+   return saveSettingsToFlash(EEPROM_SETTINGS_ADR);
 }
 
 void startupCounter(int reset) {
@@ -3527,12 +3736,34 @@ static uint8_t displayContent() {
    return EEPROM.read(EEPROM_DISPLAY_CONTENT_ADR);
 }
 
-static void setDisplayContent(uint8_t content) {
-   if (EEPROM.read(EEPROM_DISPLAY_CONTENT_ADR) != content) {
-      EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, content);
-      EEPROM.commit();
+#ifdef EPD_TYPE_13INCH
+static bool storedRasterOffset(SerialFlashFile &file, uint32_t &offset) {
+   uint8_t header[54];
+   if (!file || file.read(header, sizeof(header)) != sizeof(header)) return false;
+   offset = 0;
+   if (header[0] == 'B' && header[1] == 'M') {
+      if (readLe32(header + 18) != IMG_WIDTH || int32_t(readLe32(header + 22)) != -IMG_HEIGHT ||
+          readLe16(header + 28) != 4 || readLe32(header + 30) != 0) return false;
+      offset = readLe32(header + 10);
+      if (offset < sizeof(header)) return false;
    }
+   return offset <= file.size() && file.size() - offset >= IMG_WIDTH * IMG_HEIGHT / 2;
 }
+
+static bool renderStoredQuarter(unsigned quarter) {
+   prepareSpiBusForFlash();
+   auto candidate = SerialFlash.open(activeImageSlotName());
+   auto previous = SerialFlash.open(imageSlotName(candidateImageSlot()));
+   uint32_t newOffset, oldOffset;
+   const bool ok = secondaryImageSlotAvailable && storedRasterOffset(candidate, newOffset) &&
+                   storedRasterOffset(previous, oldOffset) &&
+                   writeImageQuarter13(SPI, candidate, newOffset, previous, oldOffset,
+                                       EEPROM.read(QUARTER_ROTATION_ADDRESS) == 1, quarter);
+   if (previous) previous.close();
+   if (candidate) candidate.close();
+   return ok;
+}
+#endif
 
 static void loadRenderJournal() {
    static_assert(RENDER_JOURNAL_ADDRESS + sizeof(RenderJournal) <= EEPROM_SIZE, "Render record must fit EEPROM");
@@ -3541,7 +3772,7 @@ static void loadRenderJournal() {
    if (!validRenderJournal(renderJournal)) renderJournal = {};
    renderJournalAtBoot = renderJournal;
    if (renderNeedsRecovery(renderJournal)) {
-      Serial.printf("[IMAGE] Incomplete render at boot: attempt=%lu stage=%s slot=%u result=%d; full redraw required.\n",
+      Serial.printf("[IMAGE] Incomplete render at boot: attempt=%lu stage=%s slot=%u result=%d; display recovery required.\n",
                     (unsigned long)renderJournal.attempt, renderStageName(renderJournal.stage),
                     renderJournal.slot, renderJournal.result);
    }
@@ -3622,7 +3853,10 @@ static bool beginImageRender(uint8_t target) {
    return true;
 }
 
-static int finishImageRender(int result) {
+static int finishImageRender(int result, bool segmented = false) {
+   const uint8_t oldPresentation = displayContent();
+   const uint8_t oldPending = EEPROM.read(PENDING_IMAGE_ADDRESS);
+   const uint8_t oldProgress = EEPROM.read(QUARTER_PROGRESS_ADDRESS);
    if (result == 0 && !waitDisplayComplete(false)) result = -1;
    renderMonitoring = false;
    display.epd2.setBusyCallback(nullptr, nullptr);
@@ -3630,8 +3864,21 @@ static int finishImageRender(int result) {
    renderJournal.result = result;
    renderJournal.stage = result == 0 ? RenderStage::Complete : RenderStage::Failed;
    // Commit the completed presentation together with the journal, after BUSY is released.
-   if (result == 0) EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, renderJournal.target);
-   if (!saveRenderJournal()) result = -1;
+   if (result == 0) {
+      EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, renderJournal.target);
+      if (renderJournal.target == DISPLAY_PICTURE) {
+         EEPROM.write(PENDING_IMAGE_ADDRESS, 0);
+         EEPROM.write(QUARTER_PROGRESS_ADDRESS, segmented ? QUARTER_CLEANUP_DUE : 0);
+      }
+   }
+   if (!saveRenderJournal()) {
+      EEPROM.write(EEPROM_DISPLAY_CONTENT_ADR, oldPresentation);
+      EEPROM.write(PENDING_IMAGE_ADDRESS, oldPending);
+      EEPROM.write(QUARTER_PROGRESS_ADDRESS, oldProgress);
+      renderJournal.stage = RenderStage::Failed;
+      renderJournal.result = result = -1;
+      EEPROM.put(RENDER_JOURNAL_ADDRESS, renderJournal);
+   }
    Serial.printf("[IMAGE] Render %s: result=%d elapsed=%lu ms sampledMin=%u mV\n",
                  result == 0 ? "complete" : "failed", result, (unsigned long)renderJournal.elapsedMs,
                  renderJournal.batteryMinimumMv);
@@ -3639,10 +3886,126 @@ static int finishImageRender(int result) {
    return result;
 }
 
+#ifdef PANEL_QUARTER_TRIAL
+struct QuarterTrialRecord {
+   uint32_t attempt = 0;
+   uint32_t elapsedMs[4] = {};
+   uint16_t minimumMv[4] = {};
+   uint8_t completed = 0;
+   bool usbSeen = false;
+};
+constexpr int QUARTER_TRIAL_ADDRESS = 1500;
+static_assert(QUARTER_TRIAL_ADDRESS + sizeof(QuarterTrialRecord) <= EEPROM_SIZE);
+static_assert(QUARTER_TRIAL_ADDRESS > 1452 + sizeof(uint32_t));
+
+// A workshop-only, one-shot comparison. Regular USB recovery always uses the original active slot.
+static void runQuarterTrial() {
+   const uint32_t start = millis();
+   while (usbCheckConnect() && millis() - start < 90000) delay(100);
+   if (usbCheckConnect() || readVDD(true) < BAT_OFF_VALUE) return;
+   powerSupplyDisplay(true);
+   prepareSpiBusForFlash();
+   auto previous = SerialFlash.open(activeImageSlotName());
+   auto candidate = SerialFlash.open(imageSlotName(candidateImageSlot()));
+   uint32_t oldOffset, newOffset;
+   if (!secondaryImageSlotAvailable || !storedRasterOffset(previous, oldOffset) || !storedRasterOffset(candidate, newOffset)) return;
+   if (settings.autoRotation) accUpdateOrient();
+   else displaySetRotation(settings.manualOrientation);
+   EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+   if (!beginImageRender(6)) return;
+   QuarterTrialRecord trial;
+   trial.attempt = renderJournal.attempt;
+   EEPROM.put(QUARTER_TRIAL_ADDRESS, trial);
+   bool ok = saveRenderJournal();
+   uint16_t totalMinimum = renderJournal.batteryBeforeMv;
+   for (unsigned quarter = 0; ok && quarter < 4; ++quarter) {
+      trial.usbSeen = trial.usbSeen || usbCheckConnect();
+      const int before = readVDD(true);
+      if (trial.usbSeen || before < BAT_OFF_VALUE) { ok = false; break; }
+      tickerFailsave.once_ms(FAILSAVE_TIMER * 1000, timeoutFailsafe, 0);
+      renderJournal.batteryMinimumMv = before;
+      const uint32_t started = millis();
+      ok = writeImageQuarter13(SPI, candidate, newOffset, previous, oldOffset, displaySettings.rotationPicture > 0, quarter);
+      trial.elapsedMs[quarter] = millis() - started;
+      trial.minimumMv[quarter] = renderJournal.batteryMinimumMv;
+      totalMinimum = min(totalMinimum, trial.minimumMv[quarter]);
+      trial.usbSeen = trial.usbSeen || usbCheckConnect();
+      if (ok) trial.completed++;
+      EEPROM.put(QUARTER_TRIAL_ADDRESS, trial);
+      ok = saveRenderJournal() && ok && !trial.usbSeen;
+   }
+   previous.close();
+   candidate.close();
+   EEPROM.put(QUARTER_TRIAL_ADDRESS, trial);
+   renderJournal.batteryMinimumMv = totalMinimum;
+   finishImageRender(ok ? 0 : -1);
+}
+#endif
+
+#ifdef EPD_TYPE_13INCH
+static int showQuarterImage() {
+   renderPending = true;
+   desiredPresentation = DISPLAY_PICTURE;
+   if (!beginImageRender(DISPLAY_PICTURE)) return -1;
+   unsigned quarter = EEPROM.read(QUARTER_PROGRESS_ADDRESS) - QUARTER_START;
+   int result = 0;
+   while (quarter < 4) {
+      tickerFailsave.once_ms(FAILSAVE_TIMER * 1000, timeoutFailsafe, 0);
+      if ((!usbCheckConnect() && readVDD(true) < BAT_OFF_VALUE) || !renderStoredQuarter(quarter)) {
+         result = -1;
+         break;
+      }
+      EEPROM.write(QUARTER_PROGRESS_ADDRESS, QUARTER_START + quarter + 1);
+      if (!EEPROM.commit()) {
+         EEPROM.write(QUARTER_PROGRESS_ADDRESS, QUARTER_START + quarter);
+         result = -1;
+         break;
+      }
+      Serial.printf("[EPD] Battery image window %u/4 complete.\n", ++quarter);
+   }
+   result = finishImageRender(result, true);
+   if (result == 0) {
+      renderedPresentation = DISPLAY_PICTURE;
+      renderPending = false;
+   }
+   return result;
+}
+#endif
+
+static int showUsbNotice(const String &fileName) {
+#ifdef EPD_TYPE_13INCH
+   const uint8_t previous = displayContent();
+   // An existing small warning can stay visible throughout the outage.
+   if ((previous == DISPLAY_USB_NOTICE || previous == DISPLAY_ERROR_OVERLAY) &&
+       !renderNeedsRecovery(renderJournal)) return 0;
+   const bool hasBacking = hasValidFlashImage(fileName.c_str());
+   if (renderNeedsRecovery(renderJournal) || previous != DISPLAY_PICTURE || !hasBacking) {
+      // A partial warning cannot establish that the underlying full image is complete.
+      EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+   }
+   if (!beginImageRender(DISPLAY_USB_NOTICE)) return -1;
+   const int result = finishImageRender(showUsbPowerOverlay(hasBacking && !newImageNeedsRender() ? fileName : String()));
+   if (result == 0) renderedPresentation = DISPLAY_USB_NOTICE;
+   renderPending = true;
+   return result;
+#else
+   (void)fileName;
+   return RENDER_USB_REQUIRED;
+#endif
+}
+
 int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
+   if (!usbCheckConnect()) {
+#ifdef EPD_TYPE_13INCH
+      if (quartersPending()) return showQuarterImage();
+#endif
+      showUsbNotice(fileName);
+      return RENDER_USB_REQUIRED;
+   }
    bool restoreErrorRegion = false;
 #ifdef EPD_TYPE_13INCH
-   restoreErrorRegion = sourceUnchanged && renderedPresentation == DISPLAY_ERROR_OVERLAY &&
+   restoreErrorRegion = sourceUnchanged && !quarterCleanupDue() && !newImageNeedsRender() && (renderedPresentation == DISPLAY_ERROR_OVERLAY ||
+                         renderedPresentation == DISPLAY_USB_NOTICE) &&
                         !renderNeedsRecovery(renderJournal);
 #else
    (void)sourceUnchanged;
@@ -3654,8 +4017,14 @@ int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
       Serial.println("[IMAGE] Source unchanged; restoring only the error overlay region.");
    else
       logImageSlotCrc(fileName.c_str());
-   int result = restoreErrorRegion ? restoreImageErrorOverlay(fileName) : setImageFromFS(fileName);
+   int result = restoreErrorRegion ? restoreImageErrorOverlay(fileName, renderedPresentation == DISPLAY_USB_NOTICE) : setImageFromFS(fileName);
    result = finishImageRender(result);
+   if (result == RENDER_USB_REQUIRED) {
+#ifdef EPD_TYPE_13INCH
+      if (quartersPending()) return showQuarterImage();
+#endif
+      showUsbNotice(fileName);
+   }
    if (result == 0) {
       renderedPresentation = DISPLAY_PICTURE;
       renderPending = false;
@@ -3664,6 +4033,7 @@ int showStoredImage(const String &fileName, bool sourceUnchanged = false) {
 }
 
 static int showImageError(const String &fileName, bool hasPicture) {
+   if (!usbCheckConnect()) return showUsbNotice(fileName);
    if (hasPicture && renderNeedsRecovery(renderJournal)) {
       Serial.println("[IMAGE] Recovering the full stored image before applying an error overlay.");
       if (showStoredImage(fileName) != 0) return -1;
@@ -3684,8 +4054,7 @@ static int showImageError(const String &fileName, bool hasPicture) {
       return result;
    }
 
-   displaySetText("Error: Picture download failed, please try again", false, true);
-   if (finishImageRender(0) != 0)
+   if (finishImageRender(displaySetText("Error: Picture download failed, please try again", false, true)) != 0)
       return -1;
    renderedPresentation = DISPLAY_ERROR_TEXT;
    renderPending = false;
@@ -3699,13 +4068,16 @@ static void showNotice(uint8_t content, const char *text, const char *text2 = ""
    }
    renderPending = true;
    if (!beginImageRender(content)) return;
-   displaySetText(text, false, true, text2);
-   if (finishImageRender(0) != 0)
+   if (finishImageRender(displaySetText(text, false, true, text2)) != 0)
       return;
    desiredPresentation = content;
    renderedPresentation = content;
    renderPending = false;
 }
+
+#ifdef PANEL_EMERGENCY_CONFIG
+#include "emergency_service.h"
+#endif
 
 void runSetupMode() {
    Serial.println("[MAIN] Setup Mode Triggered");
@@ -3720,6 +4092,9 @@ void runSetupMode() {
 
    // Wait for completion, disconnect, or timeout
    while (true) {
+#ifdef PANEL_EMERGENCY_CONFIG
+      emergency::poll();
+#endif
       bool isBleTransferActive = (bool)bleFile || fwUpdateInProgress;
 
       if (!isBleTransferActive && wifiScanRequested) {
@@ -3751,7 +4126,7 @@ void runSetupMode() {
          Serial.println("[NETWORK] Scan completed and notified.");
       }
 
-      if (pServer->getConnectedCount() > 0) {
+      if (pServer && pServer->getConnectedCount() > 0) {
          if (!bleWasConnected) {
             bleWasConnected = true;
             bleConnectedTime = millis();
@@ -3811,13 +4186,13 @@ void runSetupMode() {
       if (applyPending) {
          applyInProgress = true;
          applyPending = false;
-         bleImageApplied = true;
+         bleImageApplied = false;
          Serial.println("[MAIN] Applying new image within setup mode...");
          powerSupplyDisplay(true);
          if (settings.autoRotation) {
             accUpdateOrient();
          }
-         showStoredImage(activeImageSlotName());
+         bleImageApplied = showStoredImage(activeImageSlotName()) == 0;
          applyInProgress = false;
       }
 
@@ -3879,7 +4254,7 @@ void runSetupMode() {
 
          if (systemInfoCharacteristic) {
             systemInfoCharacteristic->setValue(systemInfoJson(isCharging).c_str());
-            if (pServer->getConnectedCount() > 0) {
+            if (pServer && pServer->getConnectedCount() > 0) {
                systemInfoCharacteristic->notify();
             }
          }
@@ -3907,21 +4282,58 @@ bool ensureWifi() {
 }
 
 int processHttpDownload() {
+#ifdef PANEL_EMERGENCY_CONFIG
+   if (emergencyImageActive()) return DL_NOT_MODIFIED;
+#endif
    int dlSuccess = 0;
    if (ensureWifi()) {
       dlSuccess = loadImageFromWeb(settings.downloadUrl, "tmp_raw.bin");
+      bool canUseQuarters = false;
+#ifdef EPD_TYPE_13INCH
+      canUseQuarters = dlSuccess == DL_OK && downloadedDigest.length() == 44 &&
+                       secondaryImageSlotAvailable && hasValidFlashImage(activeImageSlotName());
+#endif
+      if (dlSuccess == DL_OK && !canUseQuarters && !usbCheckConnect()) dlSuccess = RENDER_USB_REQUIRED;
       if (dlSuccess == 0) {
+         if (settings.requireImageDigest && !secondaryImageSlotAvailable && hasValidFlashImage(activeImageSlotName())) {
+            Serial.println("[IMAGE] Verified update requires an inactive slot");
+            WiFi.setSleep(true);
+            return DL_FLASH_ERROR;
+         }
          const uint8_t targetSlot = candidateImageSlot();
          const char *targetFileName = imageSlotName(targetSlot);
          if (processImageFile(DOWNLOAD_SLOT_NAME, targetFileName)) {
+            if (!canUseQuarters && !usbCheckConnect()) {
+               WiFi.setSleep(true);
+               return RENDER_USB_REQUIRED;
+            }
+            const uint8_t previousProgress = EEPROM.read(QUARTER_PROGRESS_ADDRESS);
+            const uint8_t previousRotation = EEPROM.read(QUARTER_ROTATION_ADDRESS);
+            EEPROM.write(QUARTER_PROGRESS_ADDRESS, canUseQuarters ? QUARTER_START : 0);
+            EEPROM.write(QUARTER_ROTATION_ADDRESS, displaySettings.rotationPicture > 0);
+            const uint8_t previousPending = EEPROM.read(PENDING_IMAGE_ADDRESS);
+            EEPROM.write(PENDING_IMAGE_ADDRESS, PENDING_IMAGE_MARKER);
+            const auto oldSlot = settings.activeSlot;
+            const String oldValidator = settings.lastModified;
+            const String previousDigest = activeImageDigest;
+            activeImageDigest = downloadedDigest;
             settings.activeSlot = targetSlot;
             settings.lastModified = tempLastModified;
-            saveSettingsToFlash(EEPROM_SETTINGS_ADR);
-            dlSuccess = 0;
+            if (!saveSettingsToFlash(EEPROM_SETTINGS_ADR)) {
+               EEPROM.write(QUARTER_PROGRESS_ADDRESS, previousProgress);
+               EEPROM.write(QUARTER_ROTATION_ADDRESS, previousRotation);
+               EEPROM.write(PENDING_IMAGE_ADDRESS, previousPending);
+               settings.activeSlot = oldSlot;
+               settings.lastModified = oldValidator;
+               activeImageDigest = previousDigest;
+               // Restore the EEPROM buffer before another subsystem commits.
+               saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+               dlSuccess = DL_FLASH_ERROR;
+            }
          }
          else {
             Serial.println("[IMAGE] Failed to process image file");
-            dlSuccess = -1;
+            dlSuccess = DL_FORMAT_ERROR;
          }
       }
       WiFi.setSleep(true);
@@ -3983,11 +4395,12 @@ class LimitedBody : public Stream
    size_t limit;
 };
 
-void fetchRemoteSettings() {
+bool fetchRemoteSettings() {
+   bool accepted = false;
    if (settings.settingsUrl.length() == 0)
-      return;
+      return false;
    if (WiFi.status() != WL_CONNECTED)
-      return;
+      return false;
 
    Serial.println("[HTTP] Fetching remote JSON settings...");
    // The login belongs to the server of the picture: it is only sent if the settings file is
@@ -3997,6 +4410,12 @@ void fetchRemoteSettings() {
                          settingsOrigin == urlOrigin(settings.downloadUrl);
    const String url = getRedirect(settings.settingsUrl, sendAuth);
 
+#ifdef PANEL_TRUST_CONFIG
+   PanelSecureClient secureClient;
+   HTTPClient http;
+   http.setTimeout(10000);
+   if (!beginPanelRequest(http, secureClient, url)) return false;
+#else
    WiFiClientSecure secureClient;
    secureClient.setInsecure();
    HTTPClient http;
@@ -4008,6 +4427,7 @@ void fetchRemoteSettings() {
    else {
       http.begin(url);
    }
+#endif
    if (sendAuth) {
       http.setAuthorization(settings.httpAuthUser.c_str(), settings.httpAuthPassword.c_str());
    }
@@ -4018,11 +4438,18 @@ void fetchRemoteSettings() {
          http.addHeader("If-Modified-Since", settings.settingsLastModified);
    }
 
-   const char *headerKeys[] = {"Last-Modified", "ETag"};
-   http.collectHeaders(headerKeys, 2);
+   const char *headerKeys[] = {"Last-Modified", "ETag", "X-Panel-Emergency-Generation"};
+   http.collectHeaders(headerKeys, 3);
    addTelemetryHeaders(http);
 
+#ifdef PANEL_TRUST_CONFIG
+   int httpCode = getPanelResponse(http);
+#ifdef PANEL_EMERGENCY_CONFIG
+   if (httpCode == 200 || httpCode == 304) emergency::rememberGeneration(http.header("X-Panel-Emergency-Generation"));
+#endif
+#else
    int httpCode = http.GET();
+#endif
    if (httpCode == HTTP_CODE_OK) {
       LimitedBody body(MAX_SETTINGS_JSON_SIZE);
       const bool tooLarge = http.getSize() > MAX_SETTINGS_JSON_SIZE;
@@ -4030,16 +4457,40 @@ void fetchRemoteSettings() {
       if (tooLarge || body.overflow) {
          Serial.printf("[HTTP] Settings JSON is larger than %d bytes, ignored.\n", MAX_SETTINGS_JSON_SIZE);
          http.end();
-         return;
+         return false;
       }
       if (received < 0) {
          Serial.printf("[HTTP] Reading the settings JSON failed: %s\n", http.errorToString(received).c_str());
          http.end();
-         return;
+         return false;
       }
+#ifdef PANEL_TRUST_CONFIG
+      ManagedProfile profile;
+      if (parseManagedProfile(body.text.c_str(), body.text.length(), activeProfileRevision, profile)) {
+         const Settings previous = settings;
+         const uint32_t previousRevision = activeProfileRevision;
+         settings.timeout = profile.interval;
+         settings.motionWakeup = profile.motionWakeup;
+         const String tag = http.header("ETag");
+         settings.settingsLastModified = tag.length() && tag.length() + 5 <= MAX_SETTING_STRING_LEN ? "etag:" + tag : String("");
+         writeIntToFlash(profile.interval, 210, false);
+         EEPROM.put(PROFILE_REVISION_ADDRESS, profile.revision);
+         accepted = saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+         if (accepted) {
+            activeProfileRevision = profile.revision;
+            systemData.sleepPrediction = calculateSleepDuration(settings.timeout, true, false);
+         } else {
+            settings = previous;
+            writeIntToFlash(previous.timeout, 210, false);
+            EEPROM.put(PROFILE_REVISION_ADDRESS, previousRevision);
+            saveSettingsToFlash(EEPROM_SETTINGS_ADR);
+         }
+      }
+#else
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, body.text);
       if (!error) {
+         accepted = true;
          bool changed = false;
 
          if (doc["timeout"].is<int>()) {
@@ -4127,14 +4578,17 @@ void fetchRemoteSettings() {
       else {
          Serial.println("[HTTP] JSON parse failed");
       }
+#endif
    }
    else if (httpCode == HTTP_CODE_NOT_MODIFIED) {
+      accepted = settings.settingsLastModified.length() > 0;
       Serial.println("[HTTP] JSON settings not modified.");
    }
    else {
       Serial.printf("[HTTP] GET failed, error: %s\n", http.errorToString(httpCode).c_str());
    }
    http.end();
+   return accepted;
 }
 
 void accUpdateOrient() {
@@ -4230,7 +4684,9 @@ void setup() {
 
    if (systemData.wakeupCause == wakeup_reason_t::BUTTON) {
       buttonWake = true;
+#ifndef PANEL_TRUST_CONFIG
       startupCounter(false);
+#endif
    }
 
    eepromReady = EepromInit(EEPROM_SIZE);
@@ -4295,6 +4751,9 @@ void setup() {
 
    setDeviceUid();
    setDisplayData(CLIENT_ID, systemData.vddValue);
+#if defined(PANEL_EMERGENCY_CONFIG) && defined(EPD_TYPE_13INCH)
+   if (!batteryEmpty) localPicture::restore();
+#endif
    // TODO: maybe do a function to generally check updated mem values
    float temperature = temperatureRead();
    if (DEBUG_FLAG)
@@ -4313,6 +4772,9 @@ void setup() {
       BleInit(CLIENT_ID, true);
       // updateDisplayAsync("connect_bt");
       runSetupMode();
+#if defined(PANEL_EMERGENCY_CONFIG) && defined(EPD_TYPE_13INCH)
+      localPicture::restore();
+#endif
       if (fwRebootPending) {
          // a restart was requested just as the setup mode ended
          Serial.flush();
@@ -4357,9 +4819,9 @@ void loop() {
 
    if (!presentationStateInitialized) {
       const uint8_t storedPresentation = displayContent();
-      renderedPresentation = storedPresentation <= DISPLAY_ERROR_OVERLAY ? storedPresentation : DISPLAY_PICTURE;
+      renderedPresentation = storedPresentation <= DISPLAY_USB_NOTICE ? storedPresentation : DISPLAY_PICTURE;
       desiredPresentation = renderedPresentation;
-      renderPending = renderedPresentation == DISPLAY_ERROR_TEXT || renderNeedsRecovery(renderJournal);
+      renderPending = newImageNeedsRender() || renderedPresentation == DISPLAY_ERROR_TEXT || renderNeedsRecovery(renderJournal);
       presentationStateInitialized = true;
    }
 
@@ -4376,16 +4838,15 @@ void loop() {
          displaySetRotation(settings.manualOrientation);
       }
 
-      if (batteryEmpty) {
-         // Remembered before it is drawn: if the voltage breaks down during the refresh, the
-         // frame must not try again and again.
-         setDisplayContent(DISPLAY_BATTERY_EMPTY);
-         if (settings.lastModified.length() > 0) {
-            settings.lastModified = ""; // with new batteries the picture is drawn again, also if it has not changed
-            saveSettingsToFlash(EEPROM_SETTINGS_ADR);
-         }
-         displaySetText("Battery empty - please replace or recharge", false);
-         gotToDeepSleep(86000, false, false);
+      bool allowBatteryDownload = false;
+#ifdef EPD_TYPE_13INCH
+      allowBatteryDownload = quartersPending() || settings.imageMode == 1;
+#endif
+      if (batteryEmpty || (!allowBatteryDownload && !usbCheckConnect())) {
+         if (!batteryEmpty) showUsbNotice(activeImageSlotName());
+         const int nextWake = batteryEmpty ? 86000 : max(60, settings.timeout);
+         gotToDeepSleep(nextWake, false, settings.motionWakeup && !batteryEmpty);
+         return;
       }
 
       delay(200);
@@ -4393,7 +4854,10 @@ void loop() {
       int dlSuccess = 0;
 
       // Fallback: If in BLE mode but the file is missing and we have a download URL configured, switch to URL mode
-      const bool forcedImageRefresh = forceStoredImageRefresh;
+      bool forcedImageRefresh = forceStoredImageRefresh || quartersPending();
+#ifdef PANEL_EMERGENCY_CONFIG
+      forcedImageRefresh |= emergencyImageActive() && newImageNeedsRender();
+#endif
       forceStoredImageRefresh = false;
 
       if (!forcedImageRefresh && settings.imageMode == 0 && !hasValidFlashImage(fileName.c_str()) && settings.downloadUrl.length() > 0) {
@@ -4448,13 +4912,17 @@ void loop() {
       delay(25);
 
       int setSuccess = 0;
-      if (dlSuccess == 0 || dlSuccess == 1) { // 0 = downloaded/ok, 1 = not modified
+      if (dlSuccess == RENDER_USB_REQUIRED) {
+         showUsbNotice(fileName);
+         setSuccess = RENDER_USB_REQUIRED;
+      }
+      else if (dlSuccess == 0 || dlSuccess == 1) { // 0 = downloaded/ok, 1 = not modified
          if (!forcedImageRefresh && settings.imageMode == 0 && bleImageApplied) {
             Serial.println("[IMAGE] Image was already applied during setup mode, skipping refresh.");
             setSuccess = 0;
          }
          else if (dlSuccess == 0 || settings.imageMode == 0 ||
-                  renderedPresentation != DISPLAY_PICTURE || renderPending) {
+                  renderedPresentation != DISPLAY_PICTURE || renderPending || (quarterCleanupDue() && usbCheckConnect())) {
             WiFi.disconnect(true);
             setSuccess = showStoredImage(fileName, dlSuccess == DL_NOT_MODIFIED);
          }
@@ -4464,7 +4932,10 @@ void loop() {
          }
       }
       else {
-         const int overlayResult = showImageError(fileName, hasPicture);
+         const bool preserveImage = hasPicture && settings.requireImageDigest &&
+            (dlSuccess == DL_DIGEST_ERROR || dlSuccess == DL_FORMAT_ERROR || dlSuccess == DL_INCOMPLETE ||
+             dlSuccess == DL_TOO_LARGE || dlSuccess == DL_FLASH_ERROR);
+         const int overlayResult = preserveImage ? 0 : showImageError(fileName, hasPicture);
          setSuccess = overlayResult == 0 ? -1 : overlayResult;
       }
 

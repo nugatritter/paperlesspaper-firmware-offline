@@ -143,7 +143,7 @@ class ConsoleController(QObject):
             self.log_received.emit("TX", "B · ROM-Bootloader anfordern")
             self._set_state("bootloader", "Bootloader angefordert. Falls nötig einmal Reset drücken.")
             return True
-        if command_name(command) not in {"DIAG", "HELP", "CONFIG GET", "CONFIG SET", "WIFI CONNECT", "RUN", "FORCE REFRESH IMAGE", "REBOOT"}:
+        if command_name(command) not in {"DIAG", "HELP", "CONFIG GET", "CONFIG SET", "CLOCK SET", "WIFI CONNECT", "RUN", "FORCE REFRESH IMAGE", "REBOOT"}:
             raise ValueError("Unbekannter Konsolenbefehl.")
         if "\n" in command or "\r" in command or len(command.encode("utf-8")) > 2048:
             raise ValueError("Ungültige Befehlszeile.")

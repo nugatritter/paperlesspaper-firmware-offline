@@ -10,7 +10,7 @@
 // ==========================================
 
 #ifndef SOFTWARE_VERSION
-#define SOFTWARE_VERSION "0.1.0g"
+#define SOFTWARE_VERSION "0.1.0i"
 #endif
 #define MAX_OTA_FW_SIZE 0x1D0000UL
 #define DEBUG 1

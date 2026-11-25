@@ -1,5 +1,7 @@
 #include "serial_line.h"
 #include "serial_config.h"
+#include "managed_profile.h"
+#include "workshop_clock.h"
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -10,6 +12,23 @@ static bool valid(const std::string &json) {
 }
 
 int main() {
+   int64_t epoch = 0;
+   assert(workshopEpoch("1795507200", epoch) && epoch == 1795507200);
+   assert(!hasWorkshopClock(0, epoch) && !hasWorkshopClock(epoch, epoch - 1));
+   assert(hasWorkshopClock(epoch, epoch + 604800));
+   for (const char *value : {"", "179550720", "17955072000", "1795507200x", "1577836799", "4102444800"})
+      assert(!workshopEpoch(value, epoch));
+   ManagedProfile profile = {3, 600, true};
+   for (const char *body : {R"({"revision":2,"timeout":60,"motionWakeup":false})",
+                            R"({"revision":4,"timeout":59,"motionWakeup":false})",
+                            R"({"revision":4,"timeout":1200,"motionWakeup":false,"downloadUrl":"invalid"})",
+                            R"({"revision":4,"timeout":1200,"motionWakeup":false}{})"}) {
+      assert(!parseManagedProfile(body, strlen(body), profile.revision, profile));
+      assert(profile.revision == 3 && profile.interval == 600 && profile.motionWakeup);
+   }
+   const char *newProfile = R"({"revision":4,"timeout":1200,"motionWakeup":false})";
+   assert(parseManagedProfile(newProfile, strlen(newProfile), profile.revision, profile));
+   assert(profile.revision == 4 && profile.interval == 1200 && !profile.motionWakeup);
    SerialLine<128> input;
    using Event = SerialLine<128>::Event;
    assert(input.feed('B') == Event::Bootloader);

@@ -15,6 +15,9 @@ void orientImageErrorMasks13(GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask, b
 
 bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t imageOffset,
                             GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask,
-                            int maskLeft, int maskTop, bool rotate180, bool doRefresh, bool showOverlay);
+                            int maskLeft, int maskTop, bool rotate180, bool doRefresh, bool showOverlay, bool blankBacking = false);
+
+bool writeImageQuarter13(SPIClass &spi, SerialFlashFile &candidate, uint32_t candidateOffset,
+                         SerialFlashFile &previous, uint32_t previousOffset, bool rotate180, unsigned quarter);
 
 #endif

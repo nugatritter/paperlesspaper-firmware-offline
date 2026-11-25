@@ -23,7 +23,7 @@ constexpr int RENDER_JOURNAL_ADDRESS = 1340; // Settings currently end at byte 1
 
 inline bool validRenderJournal(const RenderJournal &record) {
    return record.magic == RENDER_JOURNAL_MAGIC && record.stage >= RenderStage::Preparing &&
-          record.stage <= RenderStage::Failed && record.slot <= 1 && record.target <= 4;
+          record.stage <= RenderStage::Failed && record.slot <= 1 && record.target <= 6;
 }
 
 inline bool renderNeedsRecovery(const RenderJournal &record) {

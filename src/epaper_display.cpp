@@ -41,6 +41,15 @@ DisplaySettings displaySettings = {
 QRCode QR;
 
 bool epaperIsUpdating = false;
+static bool refreshDenied = false;
+
+// GxEPD2 calls this immediately before DRF, including refreshes inside nextPage().
+bool allowPanelRefreshCommand() {
+   if (usbCheckConnect()) return true;
+   refreshDenied = true;
+   Serial.println("[POWER] Full refresh deferred: USB power required.");
+   return false;
+}
 static bool displayIsInit = false;
 static SPIClass *epd_spi_bus = nullptr;
 static char epd_client_id[20] = {0};
@@ -329,6 +338,8 @@ static void drawImageErrorOverlay() {
 }
 
 int setImageFromFS_7inch(String fileName, bool errorOverlay) {
+   if (!usbCheckConnect()) return RENDER_USB_REQUIRED;
+   refreshDenied = false;
    epaperIsUpdating = true;
    saveFile = SerialFlash.open(fileName.c_str());
    if (!saveFile) {
@@ -412,52 +423,33 @@ int setImageFromFS_7inch(String fileName, bool errorOverlay) {
    saveFile.close();
    Serial.println("[EPD] End Draw...");
    epaperIsUpdating = false;
-   return 0;
+   return refreshDenied ? RENDER_USB_REQUIRED : 0;
 }
 
-int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bool restoreErrorOverlay) {
+int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bool restoreErrorOverlay, bool powerNotice) {
+   if (!errorOverlay && !restoreErrorOverlay && !usbCheckConnect()) return RENDER_USB_REQUIRED;
+   refreshDenied = false;
    epaperIsUpdating = true;
    saveFile = SerialFlash.open(fileName.c_str());
-   if (!saveFile) {
-      Serial.println("[BMP] File missing");
-      epaperIsUpdating = false;
-      return -1;
-   }
-
-   uint16_t width = EPD_WIDTH;
-   uint16_t height = EPD_HEIGHT;
    int offsetData = 0;
-
-   // Check if the file is a standard BMP (starts with 'BM')
-   uint8_t magic[2] = {0xFF, 0xFF};
-   saveFile.seek(0);
-   if (saveFile.read(magic, 2) == 2 && !(magic[0] == 0xFF && magic[1] == 0xFF)) {
-      if (magic[0] == 'B' && magic[1] == 'M') {
-         // It's a standard BMP file. Read the pixel data offset at byte 0x0A
-         saveFile.seek(0x0A);
-         uint32_t bmpOffset = 0;
-         saveFile.read((uint8_t *)&bmpOffset, 4);
-         offsetData = bmpOffset;
-         Serial.printf("[BMP] Detected Windows BMP. Pixel Data starts at offset: %d\n", offsetData);
+   if (saveFile) {
+      uint8_t magic[2];
+      uint32_t offset = 0;
+      bool valid = saveFile.read(magic, sizeof(magic)) == sizeof(magic) &&
+                   !(magic[0] == 0xff && magic[1] == 0xff);
+      if (valid && magic[0] == 'B' && magic[1] == 'M') {
+         saveFile.seek(0x0a);
+         valid = saveFile.read(&offset, sizeof(offset)) == sizeof(offset);
       }
-      else {
-         Serial.println("[BMP] Detected RAW payload (no BM magic). Reading from byte 0.");
-         offsetData = 0;
+      const uint32_t payload = EPD_WIDTH * EPD_HEIGHT / 2;
+      if (!valid || offset > saveFile.size() || saveFile.size() - offset < payload) {
+         saveFile.close();
+         epaperIsUpdating = false;
+         return -1;
       }
+      offsetData = offset;
    }
-   else {
-      Serial.println("[BMP] Image slot is empty/erased");
-      saveFile.close();
-      epaperIsUpdating = false;
-      return -1;
-   }
-
-   Serial.printf("[BMP] Loading Image H: %d W: %d\n", height, width);
-
-   if (width > EPD_WIDTH || height > EPD_HEIGHT || offsetData < 0 ||
-       saveFile.size() < (uint32_t)offsetData + (EPD_WIDTH * EPD_HEIGHT / 2)) {
-      Serial.printf("[BMP] Image invalid or smaller than required payload!\n");
-      saveFile.close();
+   else if (!powerNotice || restoreErrorOverlay) {
       epaperIsUpdating = false;
       return -1;
    }
@@ -488,7 +480,8 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
       overlayFont.setFontDirection(direction);
       overlayFont.setForegroundColor(1);
       overlayFont.setBackgroundColor(0);
-      const int16_t textWidth = overlayFont.getUTF8Width(IMAGE_ERROR_TEXT);
+      const char *message = powerNotice ? "Update needs USB" : IMAGE_ERROR_TEXT;
+      const int16_t textWidth = overlayFont.getUTF8Width(message);
       const int16_t textHeight = overlayFont.getFontAscent() - overlayFont.getFontDescent();
       if (textWidth <= 0 || textWidth > IMAGE_ERROR_MASK_HEIGHT - 20 || textHeight <= 0 || textHeight > IMAGE_ERROR_MASK_WIDTH - 12) {
          Serial.println("[EPD] Error text does not fit the overlay mask.");
@@ -515,7 +508,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
       else {
          overlayFont.setCursor(IMAGE_ERROR_OVERLAY_LEFT, 16 + textHeight / 2);
       }
-      overlayFont.print(IMAGE_ERROR_TEXT);
+      overlayFont.print(message);
 #ifdef EPD_TYPE_13INCH
       if (!padImageErrorBackground13(*overlayCanvas, *overlayBackgroundCanvas)) {
          Serial.println("[EPD] Error text padding exceeds the overlay mask.");
@@ -528,7 +521,7 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
       orientImageErrorMasks13(*overlayCanvas, *overlayBackgroundCanvas, rotate180, maskLeft, maskTop);
       const bool success = writeImageErrorRegion13(*epd_spi_bus, saveFile, offsetData,
                                                   *overlayCanvas, *overlayBackgroundCanvas,
-                                                  maskLeft, maskTop, rotate180, doRefresh, !restoreErrorOverlay);
+                                                  maskLeft, maskTop, rotate180, doRefresh, !restoreErrorOverlay, !saveFile);
       saveFile.close();
       epaperIsUpdating = false;
       return success ? 0 : -1;
@@ -685,12 +678,21 @@ int setImageFromFS_13inch(String fileName, bool doRefresh, bool errorOverlay, bo
 
    saveFile.close();
    epaperIsUpdating = false;
-   return 0;
+   return refreshDenied ? RENDER_USB_REQUIRED : 0;
 }
 
-int restoreImageErrorOverlay(String fileName) {
+int showUsbPowerOverlay(String fileName) {
 #ifdef EPD_TYPE_13INCH
-   const int result = setImageFromFS_13inch(fileName, true, false, true);
+   return setImageFromFS_13inch(fileName, true, true, false, true);
+#else
+   (void)fileName;
+   return RENDER_USB_REQUIRED;
+#endif
+}
+
+int restoreImageErrorOverlay(String fileName, bool powerNotice) {
+#ifdef EPD_TYPE_13INCH
+   const int result = setImageFromFS_13inch(fileName, true, false, true, powerNotice);
    Serial.printf("[EPD] Set Image Done: %d\n", result);
    return result;
 #else
@@ -710,6 +712,7 @@ int setImageFromFS(String fileName, bool doRefresh, bool errorOverlay) {
 }
 
 void displayWipe(bool quick) {
+   if (!usbCheckConnect()) return;
    if (quick) {
       display.enableQuickRefresh(displaySettings.displayQuickRefreshTime, true);
       display.init(115200);
@@ -722,7 +725,9 @@ void displayWipe(bool quick) {
    display.refresh();
 }
 
-void displaySetText(String info, bool isBlackboard, bool quickRefresh, String info2) {
+int displaySetText(String info, bool isBlackboard, bool quickRefresh, String info2) {
+   if (!usbCheckConnect()) return RENDER_USB_REQUIRED;
+   refreshDenied = false;
    int foreGround = GxEPD_BLACK_I;
    int backGround = GxEPD_WHITE_I;
    bool invert = false;
@@ -778,6 +783,7 @@ void displaySetText(String info, bool isBlackboard, bool quickRefresh, String in
       displayOverlays(display, displayInfos, invert, false);
    }
    while (display.nextPage());
+   return refreshDenied ? RENDER_USB_REQUIRED : 0;
 }
 
 bool waitDisplayComplete(bool quick) {
@@ -802,6 +808,7 @@ bool waitDisplayComplete(bool quick) {
 }
 
 void displayTurnOn() {
+   if (!usbCheckConnect()) return;
    String info = "Ich schlafe ...";
    String info2 = "Drücke die Taste auf der Rückseite";
    String info3 = "um mich zu wecken.";

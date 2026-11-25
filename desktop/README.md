@@ -308,3 +308,14 @@ Verwendete APIs: [Qt for Python](https://doc.qt.io/qtforpython-6/),
 [pySerial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html),
 [PlatformIO](https://docs.platformio.org/en/latest/core/userguide/cmd_run.html),
 [esptool](https://docs.espressif.com/projects/esptool/en/latest/esp32c6/esptool/basic-commands.html).
+
+## Werkstatt
+
+Auf der Seite „Werkstatt“ die HTTPS-Basisadresse der Verwaltung und das Werkstattkonto eingeben. CSV-Dateien verwenden die Spalten `beamline,location,model`. JSON-Dateien enthalten dieselben Einträge im Array `orders`. Modelle sind `epd7` oder `epd13`. Die Vorschau zeigt je Beamline den Standort, das Modell, den Abgleichstatus und eine bestehende Belegung. „Vorschau übernehmen“ bestätigt den Import für diese Sitzung.
+
+Das QR-Etikett liefert die öffentliche Panel-ID. „USB-Gerät inventarisieren“ und „Gerät reservieren“ lesen die aktuelle Gerätekennung und den Paneltyp mit einer neuen USB-Diagnose. Nach einem Kabelwechsel dieselbe Arbeitsliste öffnen, das Etikett erneut scannen und die Reservierung mit demselben Werkstattkonto wieder aufnehmen. Am Montageort die tatsächliche Standortangabe und den sechsstelligen Code vom Prüfschild eingeben. Bei einem Ersatzgerät wird mit der Aktivierung das vorherige Gerät gesperrt. Die Werkstattanmeldung bleibt nur im Arbeitsspeicher.
+
+„Gerätekonto einrichten“ gleicht zunächst die Reservierung und den von der verwalteten Firmware gemeldeten HTTPS-Ursprung ab. Unmittelbar vor dem Schreiben liest Panel Studio die Gerätekennung nochmals über USB. Das einmalige Passwort geht mit Bild- und Einstellungs-URL direkt in den Konfigurationsbefehl. Bei einer vorhandenen Berechtigung kann ein Zweitschlüssel übertragen werden; die anschließende Bestätigung nach erfolgreichem Geräteabruf erfolgt über die Schlüsselverwaltung. Ein Verbindungsabbruch verwirft die ausstehende lokale Übergabe.
+
+
+Verwaltete Panels können ihre UTC-Zeit über den physisch geschützten Werkstattport beziehen. Bei der Einrichtung oder Rotation eines Gerätekontos gleicht Panel Studio eine als unbestätigt gemeldete Uhr automatisch ab und liest den Zustand vor dem nächsten Schritt erneut aus. Für ein bereits eingerichtetes Gerät die Funktion **Werkstattzeit über USB übertragen** verwenden. Der Werkstattrechner benötigt die richtige Systemzeit.

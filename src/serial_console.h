@@ -91,6 +91,27 @@ static void appendRenderDiagnostics(JsonObject output, const RenderJournal &reco
 static void appendSerialDiagnostics(JsonDocument &reply) {
    JsonObject firmware = reply["firmware"].to<JsonObject>();
    firmware["version"] = SOFTWARE_VERSION;
+#ifdef PANEL_TRUST_CONFIG
+   firmware["managedOrigin"] = panelOrigin();
+   const auto now = time(nullptr);
+   firmware["clockTrusted"] = hasWorkshopClock(workshopTimeAnchor, now);
+   if (hasWorkshopClock(workshopTimeAnchor, now)) firmware["utcEpoch"] = int64_t(now);
+#endif
+#ifdef PANEL_QUARTER_TRIAL
+   firmware["quarterTrial"] = true;
+   QuarterTrialRecord trial;
+   EEPROM.get(QUARTER_TRIAL_ADDRESS, trial);
+   if (trial.attempt && trial.attempt != UINT32_MAX && trial.completed <= 4) {
+      auto report = reply["quarterTrial"].to<JsonObject>();
+      report["attempt"] = trial.attempt;
+      report["completed"] = trial.completed;
+      report["usbSeen"] = trial.usbSeen;
+      for (unsigned index = 0; index < 4; ++index) {
+         report["elapsedMs"][index] = trial.elapsedMs[index];
+         report["minimumMv"][index] = trial.minimumMv[index];
+      }
+   }
+#endif
    firmware["variant"] = "offline";
    firmware["build"] = __DATE__ " " __TIME__;
    firmware["sdk"] = ESP.getSdkVersion();
@@ -156,8 +177,17 @@ static void appendSerialDiagnostics(JsonDocument &reply) {
    panel["activeImageSlot"] = activeImageSlotName();
    panel["secondarySlotAvailable"] = secondaryImageSlotAvailable;
    panel["imageValidator"] = settings.lastModified;
+#ifdef PANEL_EMERGENCY_CONFIG
+   panel["emergencyActive"] = emergencyImageActive();
+#endif
    panel["settingsValidator"] = settings.settingsLastModified;
    JsonObject render = reply["render"].to<JsonObject>();
+#ifdef EPD_TYPE_13INCH
+   render["quartersCompleted"] = quartersPending() ? EEPROM.read(QUARTER_PROGRESS_ADDRESS) - QUARTER_START :
+                                 (quarterCleanupDue() ? 4 : 0);
+   render["quartersPending"] = quartersPending();
+   render["usbCleanupDue"] = quarterCleanupDue();
+#endif
    render["storageOk"] = renderJournalStorageOk;
    render["active"] = renderMonitoring;
    render["needsRecovery"] = renderNeedsRecovery(renderJournal);
@@ -211,7 +241,12 @@ static bool applySerialConfig(JsonObjectConst patch) {
    if (patch["chargerMode"].is<bool>()) settings.chargerMode = patch["chargerMode"].as<bool>();
    const bool credentialsChanged = settings.httpAuthUser != previous.httpAuthUser || settings.httpAuthPassword != previous.httpAuthPassword;
    const bool orientationChanged = settings.manualOrientation != previous.manualOrientation || settings.autoRotation != previous.autoRotation;
-   if (settings.downloadUrl != previous.downloadUrl || credentialsChanged || orientationChanged) settings.lastModified = "";
+   bool invalidateSource = settings.downloadUrl != previous.downloadUrl || credentialsChanged || orientationChanged ||
+                           (settings.requireImageDigest && !previous.requireImageDigest);
+#ifdef PANEL_EMERGENCY_CONFIG
+   invalidateSource &= !emergencyImageActive();
+#endif
+   if (invalidateSource) settings.lastModified = "";
    if (settings.settingsUrl != previous.settingsUrl || credentialsChanged) settings.settingsLastModified = "";
    writeStringToFlash(wifiSettings.ssid.c_str(), 0, MAX_WIFI_SSID_LEN, false);
    writeStringToFlash(wifiSettings.pss.c_str(), 40, MAX_WIFI_PASS_LEN, false);
@@ -245,13 +280,16 @@ static void handleSerialCommand(const char *line) {
       return;
    }
    serialConsoleActive = true;
-   NimBLEDevice::stopAdvertising();
+   if (wifiSettings.bleInitOk) NimBLEDevice::stopAdvertising();
    serialConsoleActivity = millis();
    JsonDocument reply;
    reply["ok"] = true;
    if (command == "HELP") {
       reply["command"] = "HELP";
       reply["commands"] = "HELP | DIAG | CONFIG GET | CONFIG SET {JSON} | WIFI CONNECT | RUN | FORCE REFRESH IMAGE | REBOOT | B";
+#ifdef PANEL_TRUST_CONFIG
+      reply["workshopCommands"] = "CLOCK SET <UTC Unix seconds> | MAINTENANCE RESET CONFIRM";
+#endif
       reply["writableKeys"] = "wifiSsid,wifiPassword,downloadUrl,settingsUrl,httpAuthUser,httpAuthPassword,timeout,imageMode,autoRotation,manualOrientation,motionWakeup,showBatteryWarning,showWifiWarning,requireImageDigest,chargerMode,confirmRechargeable";
       reply["maxLineBytes"] = 2048;
       reply["idleTimeoutSeconds"] = SETUP_IDLE_TIMEOUT;
@@ -268,6 +306,15 @@ static void handleSerialCommand(const char *line) {
       JsonDocument patch;
       const char *validation = parseSerialConfig(patch, command.c_str() + 11);
       if (validation) { serialError("CONFIG SET", validation); return; }
+#ifdef PANEL_TRUST_CONFIG
+      for (const char *key : {"downloadUrl", "settingsUrl"}) {
+         if (patch[key].is<const char *>() && strlen(patch[key].as<const char *>()) &&
+             !allowedPanelUrl(patch[key].as<String>())) {
+            serialError("CONFIG SET", "Managed URL must use the configured HTTPS origin");
+            return;
+         }
+      }
+#endif
       if (!eepromReady) { serialError("CONFIG SET", "EEPROM is unavailable"); return; }
       if (!applySerialConfig(patch.as<JsonObjectConst>())) { serialError("CONFIG SET", "Saving EEPROM failed"); return; }
       reply["command"] = "CONFIG SET";
@@ -290,6 +337,40 @@ static void handleSerialCommand(const char *line) {
       forceExitSetup = true;
       return;
    }
+#ifdef PANEL_TRUST_CONFIG
+   else if (command.startsWith("CLOCK SET ")) {
+      if (!usbCheckConnect() || !setWorkshopClock(command.c_str() + 10)) {
+         serialError("CLOCK SET", "Workshop USB and a valid non-decreasing UTC time required");
+         return;
+      }
+      reply["command"] = "CLOCK SET";
+      reply["utcEpoch"] = int64_t(time(nullptr));
+   }
+   else if (command == "MAINTENANCE RESET CONFIRM") {
+      if (!eepromReady || !usbCheckConnect()) { serialError("RESET", "Workshop USB required"); return; }
+      if (!resetAll(true)) { serialError("RESET", "Reset failed"); return; }
+      reply["command"] = "RESET";
+      serialReply(reply);
+      Serial.flush();
+      ESP.restart();
+      return;
+   }
+#endif
+#ifdef PANEL_QUARTER_TRIAL
+   else if (command == "TRIAL QUARTERS") {
+      if (!usbCheckConnect() || !eepromReady || !secondaryImageSlotAvailable ||
+          newImageNeedsRender() || displayContent() != DISPLAY_PICTURE || renderNeedsRecovery(renderJournal)) {
+         serialError("TRIAL QUARTERS", "Two slots and a completed reference picture required");
+         return;
+      }
+      reply["command"] = command;
+      serialReply(reply);
+      Serial.flush();
+      runQuarterTrial();
+      gotToDeepSleep(600, false, false);
+      return;
+   }
+#endif
    else if (command == "RUN" || command == "REBOOT") {
       reply["command"] = command;
       serialReply(reply);

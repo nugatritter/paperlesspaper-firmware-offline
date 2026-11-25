@@ -18,6 +18,7 @@ from . import __version__
 from .firmware import APP_CAPACITY, PROJECT_ROOT, UPLOAD_SPEEDS, FirmwareJob, image_summary
 from .protocol import LABELS, PASSWORD_KEYS, import_config, make_config_command, validate_config
 from .transport import ConsoleController, available_ports
+from .workshop import Workshop
 from .widgets import ConfigEditor, Dashboard, LogViewer, button, label
 
 STYLE = """
@@ -71,6 +72,7 @@ PAGE_INFO = [
     ("Einstellungen", "Verbindung, Bildquelle und Anzeige konfigurieren"),
     ("Firmware", "Projekt-Firmware für das 13,3-Zoll-Panel bauen, prüfen und übertragen"),
     ("Konsole", "Befehle ausführen und serielle Rückmeldungen verfolgen"),
+    ("Werkstatt", "Geräte inventarisieren, reservieren und am Standort aktivieren"),
 ]
 
 
@@ -164,6 +166,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.config)
         self.pages.addWidget(self._firmware_page())
         self.pages.addWidget(self._console_page())
+        self.workshop = Workshop(self.controller, self.demo)
+        self.pages.addWidget(self.workshop)
         body.addWidget(self.pages, 1)
         footer = QHBoxLayout()
         self.wifi_button = button("WLAN verbinden", lambda: self.send("WIFI CONNECT"))

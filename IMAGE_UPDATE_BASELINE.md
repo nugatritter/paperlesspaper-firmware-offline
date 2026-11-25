@@ -109,3 +109,18 @@ Partial overlay display without the previous fading is confirmed by the user. Th
 
 Earlier device checks confirmed changed-image detection, outage overlays, and recovery with a full local render. The monitor log confirms slot B at address 13,107,200. Subsequent photos confirm the corrected +90-degree text, white backing and physical upper-left position. Photo 5421.jpg and the user's report confirm successful partial overlay rendering without the old color fading. The latest backing extension and partial recovery are the remaining device checks for this revision.
 
+
+## Display power policy from 0.1.0h
+
+The battery-backed epd13 displays “Update needs USB” in the existing rotated partial window. Repeated battery wakes retain the warning. The epd7 driver refreshes the entire screen even for a window, so this model retains its visible image. A battery below the existing cutoff goes directly to sleep. The active HTTP slot and its validator stay in place when USB disappears during reception. A processed update that was already committed remains pending until a successful full render with USB power.
+
+The firmware checks the USB controller again before starting a render. The PlatformIO build also guards the actual DRF commands in both GxEPD2 drivers, including commands reached through paged text and setup screens. Missing I²C status blocks the full refresh. Driver updates require reviewing those command sites in `tools/guard_display_driver.py`. The epd13 window and its companion use the separately tested partial sequence. Once a controller has accepted a full refresh command, it needs adequate power until BUSY is released.
+
+After building epd13, run `python3 tests/run_refresh_power_host.py` to exercise the instrumented GxEPD2 refresh methods for both selected drivers. The host test simulates USB disappearing during controller power-on and checks the actual DRF call count. `python3 tests/run_partial_overlay_host.py` also checks coverage and palette for the four trial windows in both orientations.
+
+
+## Battery updates from 0.1.0i
+
+The regular epd13 HTTP image path uses four successive 600 × 800 raster windows when a changed image passes the SHA-256 readback check, the second slot exists, a prior picture is available and USB is absent. The EEPROM commit that selects the new slot records the next window and its orientation. Both image slots remain reserved until the last window is complete. A reset repeats the first unconfirmed window. A low battery defers further work. The completed picture stays on screen across unchanged battery cycles. The next successful USB image cycle redraws it once in full, including on HTTP 304. The existing hardware guard still checks USB at the full refresh command. The epd7 keeps its USB-only display policy.
+
+The workshop accepted faint seams and slightly different background whites for battery updates. A subsequent full refresh removed both effects on the test panel. The four-window workshop trial took 123.443 s. Its voltage samples do not measure peak current or total energy.

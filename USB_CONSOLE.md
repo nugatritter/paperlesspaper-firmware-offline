@@ -216,3 +216,10 @@ Am Gerät sind anschließend USB-Einstieg/Timeout, Speichern über Neustarts,
 WLAN-Verbindung, beide manuellen Landschaftslagen mit Overlays und die bestehende
 USB-Bootloader-Umschaltung zu prüfen. Die Overlay-Prüfpunkte in
 [IMAGE_UPDATE_BASELINE.md](IMAGE_UPDATE_BASELINE.md) gelten weiterhin.
+
+
+## UTC-Zeit im verwalteten Build
+
+`CLOCK SET <Unix-Sekunden>` übernimmt die Uhrzeit des vertrauenswürdigen Werkstattrechners bei anliegender USB-Spannung. Panel Studio führt den Abgleich bei der Einrichtung eines Gerätekontos automatisch aus, wenn die Diagnose `firmware.clockTrusted=false` meldet. Für ein bereits eingerichtetes Gerät gibt es im Werkstattfenster die Aktion **Werkstattzeit über USB übertragen**. Nach dem Abgleich enthält die Diagnose den bestätigten Zustand und `firmware.utcEpoch`.
+
+Die Zeitbestätigung liegt im RTC-Speicher und übersteht den regulären Tiefschlaf. Nach Verlust der Bestätigung wartet der verwaltete HTTPS-Client auf einen neuen Zeitabgleich, bevor er Anmeldedaten überträgt. Eine rückwärts gerichtete Uhrkorrektur wird abgelehnt. Bis zu drei Sekunden Übertragungslatenz werden quittiert, ohne die Uhr zurückzustellen. Der Werkstattrechner muss die richtige UTC-Zeit haben.

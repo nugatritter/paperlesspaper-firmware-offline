@@ -538,3 +538,38 @@ Die folgenden Abhängigkeiten sind nicht für `pio run -e epd13` erforderlich:
 - [PlatformIO Registry: SdFat](https://registry.platformio.org/libraries/greiman/SdFat)
 - [GxEPD2 Git-Repository](https://github.com/smarthomeagentur/GxEPD2)
 - [SerialFlash Git-Repository](https://github.com/smarthomeagentur/SerialFlash)
+
+## Verwalteter HTTPS-Build
+
+Für das 13,3-Zoll-Panel wählt `pio run -e epd13-managed` den verwalteten Bild- und Einstellungsabruf. Für das 7-Zoll-Modell heißt die Umgebung `epd7-managed`. Die Umgebungsvariable `PANEL_TRUST_CONFIG` muss auf eine Headerdatei mit genau einem DNS-Namen, dem HTTPS-Port und dem öffentlichen PEM-Zertifikat der vertrauenswürdigen Stamm-CA zeigen. Beispiel für den Aufbau der Datei:
+
+```cpp
+static constexpr char panelHost[] = "panel.example.org";
+static constexpr uint16_t panelPort = 443;
+static constexpr char panelRoot[] = R"PEM(-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+)PEM";
+```
+
+Beide URLs müssen dieselbe konfigurierte HTTPS-Origin einschließlich eines vom Standard abweichenden Ports verwenden. Weiterleitungen dürfen innerhalb dieser Origin bleiben. Der Client prüft die Gültigkeitszeiträume der CA und der vom Server gelieferten Kette. Dafür braucht das Gerät vor dem Abruf eine vertrauenswürdige UTC-Zeit. Der erste TLS-Laborlauf setzte sie über USB in der temporären Prüffirmware. In den verwalteten Builds kann Panel Studio die UTC-Zeit über den physisch geschützten Werkstattport übertragen. Nach vollständigem Spannungsverlust ist erneut eine Zeitbestätigung erforderlich. Die Instituts-CA und eine autonome Zeitversorgung nach einem Kaltstart sind noch offen.
+
+### Four-window epd13 workshop trial
+
+`pio run -e epd13-quarter-trial` builds a one-shot comparison for a panel containing a completed reference picture and a known test picture in the other slot. Both slots must have the correct epd13 raster. With USB connected and the regular picture visible, send `TRIAL QUARTERS` and wait for its acknowledgement before removing USB. The trial waits up to 90 seconds for disconnection, checks the existing battery cutoff at each quarter and drives four successive 600 × 800 stream windows. Each window corresponds to 800 × 600 pixels on the physical landscape panel.
+
+The regular image slot and network validator remain the reference for recovery. A pending full redraw is persisted before the first quarter. Each completed quarter records its duration and sampled minimum voltage. Read `quarterTrial` from `DIAG` after reconnection, then use `RUN` with USB power to restore the reference picture. A failed attempt also leaves the redraw pending. The quarter command is available only in this workshop build. An external battery-current measurement is needed to compare peak current or energy.
+
+
+Regular epd13 and epd13-managed builds from 0.1.0i include automatic four-window updates for verified HTTP images on battery. Build with the normal environment and submit a changed image through the publisher. The serial diagnostic fields `render.quartersPending`, `render.quartersCompleted` and `render.usbCleanupDue` report progress and the pending USB full refresh.
+
+
+### Verwalteter BLE-Notfalldienst
+
+Zusätzlich zu `PANEL_TRUST_CONFIG` kann ein verwalteter Build über `PANEL_EMERGENCY_CONFIG` eine Headerdatei mit dem öffentlichen P-256-Schlüssel der Freigabestelle erhalten. Die Datei definiert `static constexpr unsigned char emergencyIssuerPublic[]` mit dem DER-kodierten SubjectPublicKeyInfo. Ohne diesen Schlüssel enthält der verwaltete Build keinen BLE-Notfalldienst. Das Panel identifiziert sein Inventaretikett über den individuellen HTTP-Benutzernamen und seine Hardware über die ausgelesene Gerätekennung. Panel Studio überträgt die Werkstattzeit nach einem Kaltstart.
+
+Der Dienst prüft die Signatur der Freigabestelle, Panel-ID, Hardwarekennung, Gültigkeit und Sperrstand. Das Handy signiert für jede Verbindung eine neue Panel-Challenge zusammen mit Freigabehash, Aktion, Dateilänge und Bildhash. Bild und Rückkehr zum Server erfordern jeweils eine eigene Signatur. Die Übertragung schreibt zunächst in den Empfangsslot. Der aktivierte Slot wechselt erst nach vollständigem Empfang, SHA-256-Rücklesen und Formatprüfung. Eine als `emergency:` gespeicherte Fassung übersteht den regulären Bildabruf bis zur signierten Ablösung. Beim Kontakt mit dem verwalteten Einstellungsdienst übernimmt das Panel einen höheren Sperrstand.
+
+### Fester Bildabruf am Hallenpanel
+
+Beim Build von `epd13-managed` mit BLE-Dienst zusätzlich `PANEL_FIXED_IMAGE_CONFIG` auf den absoluten Pfad von `profiles/eyellowboard_image.h` setzen. Das Profil enthält das öffentliche Tomcat-Zertifikat und seinen SHA-256-Fingerabdruck. Ein Zertifikatswechsel erfordert ein aktualisiertes Panelprofil. Der Bildabruf verwendet im Panel-WLAN `https://192.168.50.1:8443/`. Jede lokale Rückkehr benötigt einen frischen Displaycode.

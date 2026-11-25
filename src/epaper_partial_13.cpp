@@ -91,6 +91,25 @@ bool waitReady(uint32_t timeoutMs, const char *stage) {
    return true;
 }
 
+bool refreshArmedWindows(SPIClass &spi) {
+   noteRenderStage(RenderStage::Refreshing);
+   writeCommand(spi, true, true, 0x04);
+   if (!waitReady(10000, "power on"))
+      return false;
+   delay(30);
+   const uint8_t refreshMode = 0x01;
+   writeCommand(spi, true, true, 0x12, &refreshMode, 1);
+   if (!waitReady(60000, "ink update"))
+      return false;
+   display.powerOff();
+   if (!waitReady(10000, "power off"))
+      return false;
+   delay(300);
+   const uint8_t disabledWindow[9] = {};
+   writeCommand(spi, true, true, 0x83, disabledWindow, sizeof(disabledWindow));
+   return true;
+}
+
 void rotateMask180(GFXcanvas1 &mask) {
    const int width = mask.width();
    const int height = mask.height();
@@ -153,7 +172,7 @@ bool padImageErrorBackground13(GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask)
 
 bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t imageOffset,
                             GFXcanvas1 &textMask, GFXcanvas1 &backgroundMask,
-                            int maskLeft, int maskTop, bool rotate180, bool doRefresh, bool showOverlay) {
+                            int maskLeft, int maskTop, bool rotate180, bool doRefresh, bool showOverlay, bool blankBacking) {
    int left = textMask.width();
    int top = textMask.height();
    int right = 0;
@@ -189,7 +208,12 @@ bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t ima
    const size_t byteCount = region.width * region.height / 2;
    std::unique_ptr<uint8_t[]> pixels(new (std::nothrow) uint8_t[byteCount]);
    uint8_t companionPixels[16];
-   if (!pixels || !readRegion(image, imageOffset, region, rotate180, pixels.get()) ||
+   if (!pixels) return false;
+   if (blankBacking) {
+      memset(pixels.get(), 0x11, byteCount);
+      memset(companionPixels, 0x11, sizeof(companionPixels));
+   }
+   else if (!readRegion(image, imageOffset, region, rotate180, pixels.get()) ||
        !readRegion(image, imageOffset, companion, rotate180, companionPixels)) {
       Serial.println("[EPD] Could not prepare partial image data.");
       return false;
@@ -220,23 +244,38 @@ bool writeImageErrorRegion13(SPIClass &spi, SerialFlashFile &image, uint32_t ima
    if (!doRefresh)
       return true;
 
-   noteRenderStage(RenderStage::Refreshing);
-   writeCommand(spi, true, true, 0x04);
-   if (!waitReady(10000, "power on"))
-      return false;
-   delay(30);
-   const uint8_t refreshMode = 0x01;
-   writeCommand(spi, true, true, 0x12, &refreshMode, 1);
-   if (!waitReady(60000, "ink update"))
-      return false;
-   display.powerOff();
-   if (!waitReady(10000, "power off"))
-      return false;
-   delay(300);
-   const uint8_t disabledWindow[9] = {};
-   writeCommand(spi, true, true, 0x83, disabledWindow, sizeof(disabledWindow));
+   if (!refreshArmedWindows(spi)) return false;
    Serial.printf("[EPD] Partial overlay %s complete.\n", showOverlay ? "show" : "restore");
    return true;
+}
+
+bool writeImageQuarter13(SPIClass &spi, SerialFlashFile &candidate, uint32_t candidateOffset,
+                         SerialFlashFile &previous, uint32_t previousOffset, bool rotate180, unsigned quarter) {
+   if (quarter >= 4) return false;
+   const int half = quarter % 2;
+   const Region window{half * CONTROLLER_WIDTH, int(quarter / 2) * (PANEL_HEIGHT / 2),
+                       CONTROLLER_WIDTH, PANEL_HEIGHT / 2};
+   const Region companion{(1 - half) * CONTROLLER_WIDTH, window.y, 16, 2};
+   constexpr int stripRows = 16;
+   std::unique_ptr<uint8_t[]> pixels(new (std::nothrow) uint8_t[CONTROLLER_WIDTH * stripRows / 2]);
+   uint8_t companionPixels[16];
+   // The companion shows whichever image is already visible on the other controller.
+   if (!pixels || !readRegion(half ? candidate : previous, half ? candidateOffset : previousOffset,
+                              companion, rotate180, companionPixels)) return false;
+   display.enableQuickRefresh(0, false);
+   display.init(115200);
+   noteRenderStage(RenderStage::Streaming);
+   for (int row = window.y; row < window.y + window.height; row += stripRows) {
+      const Region strip{window.x, row, window.width, stripRows};
+      digitalWrite(CS_EPD_PIN, HIGH);
+      digitalWrite(EPD_CS_S, HIGH);
+      if (!readRegion(candidate, candidateOffset, strip, rotate180, pixels.get())) return false;
+      display.writeImage(pixels.get(), strip.x, strip.y, strip.width, strip.height);
+   }
+   display.writeImage(companionPixels, companion.x, companion.y, companion.width, companion.height);
+   armRegion(spi, half, window);
+   armRegion(spi, 1 - half, companion);
+   return refreshArmedWindows(spi);
 }
 
 #endif

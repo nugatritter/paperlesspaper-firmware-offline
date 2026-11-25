@@ -65,13 +65,14 @@ struct SPIClass {
       }
    }
 } spi;
+bool streamingStrips = false;
 struct SerialFlashFile {
    std::vector<uint8_t> data;
    uint32_t position = 0;
    bool shortRead = false;
-   void seek(uint32_t offset) { assert(!panelTouched); position = offset; }
+   void seek(uint32_t offset) { assert(!panelTouched || streamingStrips); position = offset; }
    uint32_t read(uint8_t *destination, uint32_t count) {
-      assert(!panelTouched);
+      assert(!panelTouched || streamingStrips);
       assert(chipLevel[CS_EPD_PIN] == HIGH && chipLevel[EPD_CS_S] == HIGH);
       if (shortRead || position + count > data.size())
          return 0;
@@ -165,7 +166,7 @@ int main() {
       background.fillRect(12, 8, 32, 564, 1);
       background.drawPixel(20, 20, 0);
       text.drawPixel(14, 10, 1);
-      assert(writeImageErrorRegion13(spi, image, offset, text, background, maskLeft, 24, rotated, true, showOverlay));
+      assert(writeImageErrorRegion13(spi, image, offset, text, background, maskLeft, 24, rotated, true, showOverlay, false));
       assert(display.writes.size() == 2);
       assert(display.writes[0].x == maskLeft + 12 && display.writes[0].y == 32);
       assert(display.writes[0].pixels.size() == 9024 && display.writes[1].pixels.size() == 16);
@@ -193,7 +194,7 @@ int main() {
       if (failure == 1) image.shortRead = true;
       if (failure == 2) std::fill(image.data.begin(), image.data.end(), 0x44);
       if (failure == 3) hangRefresh = true;
-      assert(!writeImageErrorRegion13(spi, image, 0, text, background, 1112, 24, false, true, true));
+      assert(!writeImageErrorRegion13(spi, image, 0, text, background, 1112, 24, false, true, true, false));
       if (failure != 3) assert(!panelTouched && commands.empty());
       else assert(elapsedMs >= 60000 && Serial.messages.find("complete.") == std::string::npos);
       cases++;
@@ -202,9 +203,17 @@ int main() {
    auto image = imageFixture(0);
    GFXcanvas1 text(64, 640), background(64, 640);
    background.drawPixel(13, 9, 1);
-   assert(writeImageErrorRegion13(spi, image, 0, text, background, 1112, 24, false, false, true));
+   assert(writeImageErrorRegion13(spi, image, 0, text, background, 1112, 24, false, false, true, false));
    assert(display.writes[0].width == 16 && display.writes[0].height == 2);
    assert(commands.size() == 4 && !refreshStarted && powerOffCalls == 0);
+   cases++;
+   reset();
+   SerialFlashFile missingImage;
+   text.drawPixel(13, 9, 1);
+   assert(writeImageErrorRegion13(spi, missingImage, 0, text, background, 1112, 24, false, true, true, true));
+   assert(display.writes.size() == 2 && display.writes[0].width == 16 && display.writes[0].height == 2);
+   assert(display.writes[1].pixels == std::vector<uint8_t>(16, 0x11));
+   assert(commands[5].bytes == std::vector<uint8_t>({0x12, 1}));
    cases++;
    for (int paddingCase : {0, 1, 2}) {
       GFXcanvas1 glyphs(64, 640), backing(64, 640);
@@ -215,7 +224,7 @@ int main() {
          assert(backing.getPixel(12, 8) && backing.getPixel(43, 583));
          assert(!backing.getPixel(44, 583) && !backing.getPixel(43, 584));
          reset();
-         assert(writeImageErrorRegion13(spi, image, 0, glyphs, backing, 1112, 24, false, true, false));
+         assert(writeImageErrorRegion13(spi, image, 0, glyphs, backing, 1112, 24, false, true, false, false));
          assert(display.writes[0].y == 32 && display.writes[0].height == 576);
          checkPixels(display.writes[0], false, 1112, glyphs, backing, false);
       }
@@ -244,7 +253,7 @@ int main() {
       }
       reset();
       auto rotatedImage = imageFixture(0);
-      assert(writeImageErrorRegion13(spi, rotatedImage, 0, glyphs, backing, maskLeft, maskTop, rotated, true, showOverlay));
+      assert(writeImageErrorRegion13(spi, rotatedImage, 0, glyphs, backing, maskLeft, maskTop, rotated, true, showOverlay, false));
       const ImageWrite &write = display.writes[0];
       checkPixels(write, rotated, maskLeft, glyphs, backing, showOverlay, maskTop);
       // The glyph pixel sits at the picture's own position: panel point mapped through the 180-degree turn.
@@ -256,5 +265,33 @@ int main() {
       assert(value == (showOverlay ? 0 : driverColor(sourceColor(rotated ? 1199 - glyphX : glyphX, rotated ? 1599 - glyphY : glyphY))));
       cases++;
    }
-   std::printf("PASS: %d partial overlay cases (show/restore, palette, rotation, padding, SPI order, failures, manual orientation).\n", cases);
+   streamingStrips = true;
+   for (bool rotated : {false, true}) {
+      auto candidate = imageFixture(118);
+      SerialFlashFile previous;
+      previous.data.assign(960000, 0x66);
+      GFXcanvas1 empty(1, 1);
+      for (unsigned quarter = 0; quarter < 4; ++quarter) {
+         reset();
+         assert(writeImageQuarter13(spi, candidate, 118, previous, 0, rotated, quarter));
+         assert(display.writes.size() == 51);
+         for (int strip = 0; strip < 50; ++strip) {
+            auto &write = display.writes[strip];
+            assert(write.width == 600 && write.height == 16 && write.x == int(quarter % 2) * 600 &&
+                   write.y == int(quarter / 2) * 800 + strip * 16);
+            checkPixels(write, rotated, 0, empty, empty, false);
+         }
+         const auto &companion = display.writes.back();
+         assert(companion.width == 16 && companion.height == 2);
+         if (quarter % 2) checkPixels(companion, rotated, 0, empty, empty, false);
+         else assert(companion.pixels == std::vector<uint8_t>(16, 0x11));
+         assert(commands[5].bytes == std::vector<uint8_t>({0x12, 1}) && powerOffCalls == 1);
+         cases++;
+      }
+      reset();
+      assert(!writeImageQuarter13(spi, candidate, 118, previous, 0, rotated, 4) && commands.empty());
+      candidate.shortRead = true;
+      assert(!writeImageQuarter13(spi, candidate, 118, previous, 0, rotated, 0) && !refreshStarted);
+   }
+   std::printf("PASS: %d partial-window cases (overlays, four quarters, palette, rotation, padding, SPI order and failures).\n", cases);
 }

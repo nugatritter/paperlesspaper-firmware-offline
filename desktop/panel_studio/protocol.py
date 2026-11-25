@@ -125,7 +125,10 @@ def make_config_command(values: dict[str, Any]) -> str:
 
 
 def command_name(command: str) -> str:
-    return "CONFIG SET" if command.startswith("CONFIG SET ") else command
+    for name in ("CONFIG SET", "CLOCK SET"):
+        if command.startswith(name + " "):
+            return name
+    return command
 
 
 def safe_command_label(command: str) -> str:

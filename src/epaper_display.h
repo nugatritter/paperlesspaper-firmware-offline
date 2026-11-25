@@ -68,12 +68,15 @@ void displaySetQuickRefresh(bool enable, int refreshTime = 0, int wipeTime = 0);
 void displaySetOverlayOption(DisplayInfoKey key, bool value);
 void displayTypeDetect();
 void displayOverlays(DisplayType &display, DisplayInfo displayData, bool invertColors, bool fullcolor = false);
+constexpr int RENDER_USB_REQUIRED = -11;
+bool usbCheckConnect();
+int showUsbPowerOverlay(String fileName);
 int setImageFromFS_7inch(String fileName, bool errorOverlay = false);
-int setImageFromFS_13inch(String fileName, bool doRefresh = true, bool errorOverlay = false, bool restoreErrorOverlay = false);
+int setImageFromFS_13inch(String fileName, bool doRefresh = true, bool errorOverlay = false, bool restoreErrorOverlay = false, bool powerNotice = false);
 int setImageFromFS(String fileName, bool doRefresh = true, bool errorOverlay = false);
-int restoreImageErrorOverlay(String fileName);
+int restoreImageErrorOverlay(String fileName, bool powerNotice = false);
 void displayWipe(bool quick);
-void displaySetText(String info, bool isBlackboard, bool quickRefresh = true, String info2 = ""); // info2: second, smaller line
+int displaySetText(String info, bool isBlackboard, bool quickRefresh = true, String info2 = ""); // info2: second, smaller line
 bool waitDisplayComplete(bool quick);
 void displayTurnOn();
 uint16_t getColor(uint8_t color);
